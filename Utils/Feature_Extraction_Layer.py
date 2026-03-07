@@ -2,6 +2,7 @@
 
 import torch.nn as nn
 import torch
+import torchaudio.transforms as T
 from .LogMelFilterBank import MelSpectrogramExtractor  
 
 class Feature_Extraction_Layer(nn.Module):
@@ -34,6 +35,16 @@ class Feature_Extraction_Layer(nn.Module):
         )
 
         self.features = {'LogMelFBank': self.LogMelFBank}
+        
+        # =====================================================================
+        # >>> 核心创新：物理声谱掩码数据增强 (SpecAugment) <<<
+        # 强制增加训练难度，逼迫 PhysicalHarmonicGCN 发挥谐波推导与时序重建的作用
+        # =====================================================================
+        # 频率掩码：随机遮蔽最高 24 个梅尔频带 (模拟 LOFAR 线谱被海洋宽带噪声淹没)
+        self.freq_masking = T.FrequencyMasking(freq_mask_param=24)
+        # 时间掩码：随机遮蔽最高 30 个时间帧 (模拟螺旋桨节拍信号在远距离传播中的衰落缺失)
+        self.time_masking = T.TimeMasking(time_mask_param=30)
+        # =====================================================================
                 
         self.output_dims = None
         self.calculate_output_dims()
@@ -51,10 +62,15 @@ class Feature_Extraction_Layer(nn.Module):
             self.output_dims = None
             
     def forward(self, x):
+        # 提取基础对数梅尔声谱图: [Batch, Freq, Time]
+        x = self.features[self.input_feature](x) 
 
-        x = self.features[self.input_feature](x) # torch.Size([64, 128, 157])
+        # 仅在模型处于训练模式 (Training) 时，施加残酷的物理掩码
+        # 验证集和测试集 (Eval) 必须看清晰的完整图像
+        if self.training:
+            x = self.freq_masking(x)
+            x = self.time_masking(x)
 
-        x = x.unsqueeze(1)
+        x = x.unsqueeze(1) # 增加通道维度 -> [Batch, 1, Freq, Time]
 
         return x
-

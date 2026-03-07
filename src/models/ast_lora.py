@@ -1,30 +1,24 @@
 import torch
 import torch.nn as nn
 import os
-import math  # 移除未使用的wget导入，避免触发下载逻辑
+import math  
 os.environ['TORCH_HOME'] = 'pretrained_models'
 import timm
 from timm.models.layers import to_2tuple, trunc_normal_
+
+# 导入我们刚刚创建的物理图卷积网络
+from src.models.ast_graph import PhysicalHarmonicGCN
 
 # ------------------------------------------------------------
 # LoRA_qkv Module with Optional "q" or "qv" Update Modes
 # ------------------------------------------------------------
 class LoRA_qkv(nn.Module):
     def __init__(self, linear_layer: nn.Linear, r: int = 4, alpha: float = 1.0, update_mode: str = "qv"):
-        """
-        Wraps the original qkv linear layer (which outputs concatenated Q, K, V) and adds low-rank updates.
-        
-        Args:
-            linear_layer: The original qkv projection layer (output shape: [B, N, 3*dim]).
-            r: The LoRA rank.
-            alpha: Scaling factor for the LoRA update.
-            update_mode: Either "qv" (update both query and value) or "q" (update query only).
-        """
         super(LoRA_qkv, self).__init__()
         self.in_features = linear_layer.in_features
         self.out_features = linear_layer.out_features
-        assert self.out_features % 3 == 0, "Expected out_features to be divisible by 3 (query, key, value)"
-        self.dim = self.out_features // 3  # dimension for each of Q, K, V
+        assert self.out_features % 3 == 0, "Expected out_features to be divisible by 3"
+        self.dim = self.out_features // 3  
         self.r = r
         self.alpha = alpha
         self.update_mode = update_mode.lower()
@@ -32,7 +26,6 @@ class LoRA_qkv(nn.Module):
             raise ValueError("update_mode must be either 'q' or 'qv'")
         self.scaling = alpha / r if r > 0 else 0
 
-        # Freeze and store the original weight and bias.
         self.register_buffer("weight", linear_layer.weight.detach().clone())
         if linear_layer.bias is not None:
             self.register_buffer("bias", linear_layer.bias.detach().clone())
@@ -40,13 +33,11 @@ class LoRA_qkv(nn.Module):
             self.bias = None
 
         if r > 0:
-            # Create LoRA parameters for the query part (always)
             self.lora_A_q = nn.Parameter(torch.zeros(self.dim, r))
             self.lora_B_q = nn.Parameter(torch.zeros(r, self.in_features))
             nn.init.kaiming_uniform_(self.lora_B_q, a=math.sqrt(5))
             nn.init.zeros_(self.lora_A_q)
             if self.update_mode == "qv":
-                # Also create LoRA parameters for the value part.
                 self.lora_A_v = nn.Parameter(torch.zeros(self.dim, r))
                 self.lora_B_v = nn.Parameter(torch.zeros(r, self.in_features))
                 nn.init.kaiming_uniform_(self.lora_B_v, a=math.sqrt(5))
@@ -61,20 +52,17 @@ class LoRA_qkv(nn.Module):
             self.lora_B_v = None
 
     def forward(self, x):
-        # Compute the original qkv output (frozen weights)
-        original_out = torch.nn.functional.linear(x, self.weight, self.bias)  # shape: [B, N, 3*dim]
+        original_out = torch.nn.functional.linear(x, self.weight, self.bias) 
         if self.r > 0:
-            # Compute low-rank update for the query part.
-            delta_q = (x @ self.lora_B_q.T) @ self.lora_A_q.T  # shape: [B, N, dim]
+            delta_q = (x @ self.lora_B_q.T) @ self.lora_A_q.T  
             delta_q = delta_q * self.scaling
             out = original_out.clone()
-            out[..., :self.dim] += delta_q  # add update to query part
+            out[..., :self.dim] += delta_q  
             
-            # Compute and add update for value part if update_mode=="qv"
             if self.update_mode == "qv":
-                delta_v = (x @ self.lora_B_v.T) @ self.lora_A_v.T  # shape: [B, N, dim]
+                delta_v = (x @ self.lora_B_v.T) @ self.lora_A_v.T  
                 delta_v = delta_v * self.scaling
-                out[..., 2*self.dim:3*self.dim] += delta_v  # add update to value part
+                out[..., 2*self.dim:3*self.dim] += delta_v  
             return out
         else:
             return original_out
@@ -105,25 +93,13 @@ class ASTLoRA(nn.Module):
     def __init__(self, label_dim=527, fstride=10, tstride=10, input_fdim=128, input_tdim=1024, 
                  imagenet_pretrain=True, audioset_pretrain=True, model_size='base384', verbose=True, 
                  lora_shared=True, lora_rank=4, lora_update_mode="qv"):
-        """
-        Args:
-            label_dim: Number of output classes.
-            fstride, tstride: Strides for the projection.
-            input_fdim, input_tdim: Input feature dimensions.
-            imagenet_pretrain, audioset_pretrain: Flags to control model loading.
-            model_size: one of 'tiny224', 'small224', 'base224', 'base384'.
-            verbose: Whether to print status messages.
-            lora_shared: If True, all transformer blocks share the same LoRA_qkv module.
-            lora_rank: LoRA rank (r in the paper).
-            lora_update_mode: Either "qv" (update query and value) or "q" (update query only).
-        """
         super(ASTLoRA, self).__init__()
-        assert timm.__version__ == '0.4.5', 'Please use timm == 0.4.5, the code might not be compatible with newer versions.'
+        assert timm.__version__ == '0.4.5', 'Please use timm == 0.4.5'
 
         if verbose:
             print('---------------AST Model Summary---------------')
             print('ImageNet pretraining: {:s}, AudioSet pretraining: {:s}'.format(str(imagenet_pretrain), str(audioset_pretrain)))
-        # Override timm input shape restriction.
+        
         timm.models.vision_transformer.PatchEmbed = PatchEmbed
 
         if audioset_pretrain == False:
@@ -174,10 +150,9 @@ class ASTLoRA(nn.Module):
                 self.v.pos_embed = new_pos_embed
                 trunc_normal_(self.v.pos_embed, std=.02)
 
-        # ------------------------------
-        # AudioSet pretraining.
-        # attention module by replacing its qkv layer with a LoRA_qkv that uses the chosen update mode.
-        # ------------------------------
+            self.physical_gcn = PhysicalHarmonicGCN(in_channels=self.original_embedding_dim, num_freq_bins=f_dim, num_time_steps=t_dim)
+            self.fusion_weight = nn.Parameter(torch.tensor(0.1))
+
         elif audioset_pretrain == True:
             if audioset_pretrain == True and imagenet_pretrain == False:
                 raise ValueError('Currently a model pretrained only on AudioSet is not supported, please set imagenet_pretrain=True.')
@@ -185,12 +160,10 @@ class ASTLoRA(nn.Module):
                 raise ValueError('Currently only the base384 AudioSet pretrained model is supported.')
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-            # 关键修改1：移除自动下载逻辑，增加本地文件检查
             model_path = 'pretrained_models/audioset_0.4593.pth'
             if not os.path.exists(model_path):
                 raise Exception(f"预训练模型文件不存在！请手动下载模型并放到 {model_path} 路径下。")
             
-            # 加载本地预训练模型
             sd = torch.load(model_path, map_location=device, weights_only=True)
             audio_model = ASTLoRA(label_dim=527, fstride=10, tstride=10, input_fdim=128, input_tdim=1024, 
                                      imagenet_pretrain=False, audioset_pretrain=False, model_size='base384', verbose=False)
@@ -201,8 +174,6 @@ class ASTLoRA(nn.Module):
             
             print(f"\nNumber of transformer blocks: {len(self.v.blocks)}")
             
-            # Patch each transformer's attention module:
-            # Replace qkv with LoRA_qkv (either shared or unique per block).
             if lora_shared:
                 shared_lora_qkv = None
                 for blk in self.v.blocks:
@@ -238,6 +209,10 @@ class ASTLoRA(nn.Module):
             new_pos_embed = new_pos_embed.reshape(1, 768, num_patches).transpose(1, 2)
             self.v.pos_embed = nn.Parameter(torch.cat([self.v.pos_embed[:, :2, :].detach(), new_pos_embed], dim=1))
 
+            # >>> 实例化图网络模块和融合权重 (基于动态计算出的 F_dim 和 T_dim) <<<
+            self.physical_gcn = PhysicalHarmonicGCN(in_channels=self.original_embedding_dim, num_freq_bins=f_dim, num_time_steps=t_dim)
+            self.fusion_weight = nn.Parameter(torch.tensor(0.1)) # 刚才漏掉了这句
+
             self.freeze_base_model()
         
     def get_shape(self, fstride, tstride, input_fdim=128, input_tdim=1024):
@@ -252,7 +227,6 @@ class ASTLoRA(nn.Module):
         for param in self.v.parameters():
             param.requires_grad = False
         
-        # Unfreeze only the LoRA parameters inside qkv.
         for blk in self.v.blocks:
             for name, param in blk.attn.qkv.named_parameters():
                 if 'lora' in name:
@@ -260,8 +234,15 @@ class ASTLoRA(nn.Module):
         
         for param in self.mlp_head.parameters():
             param.requires_grad = True
+
+        # >>> 必须解冻图网络层，让谐波和时序注意力机制能够被训练！ <<<
+        for param in self.physical_gcn.parameters():
+            param.requires_grad = True
+            
+        # >>> 解冻门控融合权重 (刚才漏掉了这句) <<<
+        self.fusion_weight.requires_grad = True
         
-        print("Base model frozen. Only LoRA parameters and classifier are trainable.")
+        print("Base model frozen. Only LoRA, Classifier, Physical GCN, and Fusion Gate are trainable.")
     
     def forward(self, x):
         B = x.shape[0]
@@ -287,7 +268,24 @@ class ASTLoRA(nn.Module):
             x = residual + x
             x = blk.drop_path(x)
 
-        x = (x[:, 0] + x[:, 1]) / 2
-        x = self.mlp_head(x)
+        # -----------------------------------------------------------------
+        # >>> 核心前向逻辑注入：使用图网络增强特征，并与全局特征融合 <<<
+        # -----------------------------------------------------------------
+        cls_dist_tokens = x[:, :2, :] 
+        patch_tokens = x[:, 2:, :]    
 
+        patch_tokens = self.physical_gcn(patch_tokens)
+
+        # global_feat = (cls_dist_tokens[:, 0] + cls_dist_tokens[:, 1]) / 2
+        # graph_feat = patch_tokens.mean(dim=1)  
+        
+        # # 使用门控机制！融合权重被 sigmoid 限制在 0-1 之间
+        # beta = torch.sigmoid(self.fusion_weight)
+        # x = (1.0 - beta) * global_feat + beta * graph_feat
+        # # -----------------------------------------------------------------
+
+        # x = self.mlp_head(x)
+        graph_feat = patch_tokens.mean(dim=1)  
+        
+        x = self.mlp_head(graph_feat)
         return x
