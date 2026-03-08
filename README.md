@@ -40,7 +40,9 @@
 
 ### 2.3 动态语义与异构图融合 (Heterogeneous Graph Fusion)
 * **动态图计算：** 利用自注意力机制（Self-Attention）根据实时输入数据计算一个动态相似度邻接矩阵 $A_{dynamic}$，捕捉非线性的突发海洋噪声关联。
-* **门控融合：** 通过可学习参数 $\alpha$ 将物理先验图与数据驱动动态图进行异构融合：$A_{combined} = \alpha A_{physical} + (1-\alpha) A_{dynamic}$。随后通过 GCN 进行特征聚合。
+* **门控融合：** 通过可学习参数 $\alpha$ 将物理先验图与数据驱动动态图进行异构融合：
+ $$A_{combined} = \alpha A_{physical} + (1-\alpha) A_{dynamic}$$。
+ 随后通过 GCN 进行特征聚合。
 
 ---
 
