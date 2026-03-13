@@ -1,15 +1,12 @@
 import torch
 import torch.nn as nn
 import lightning as L
-from torchmetrics import Accuracy, AveragePrecision
+# 1. 新增 F1Score 导入
+from torchmetrics import Accuracy, AveragePrecision, F1Score
 from src.models.custom_model import HTAN
 
 class LitModel(L.LightningModule):
     def __init__(self, Params, model_name, num_classes, numBins=None, RR=None):
-        """
-        初始化 PyTorch Lightning 模型包装器
-        numBins 和 RR 保留是为了兼容原版 demo_light.py 的传参，在纯 HTAN 模型中不再强制需要。
-        """
         super().__init__()
         self.save_hyperparameters()
         self.Params = Params
@@ -17,20 +14,23 @@ class LitModel(L.LightningModule):
         self.model_name = model_name
 
         # ---------------------------------------------------------
-        # 1. 初始化核心架构 (HTAN)
+        # 1. 初始化核心架构 (HTAN) 及其消融开关
         # ---------------------------------------------------------
         if self.model_name == 'HTAN':
-            print("🚀 Initializing HTAN (Harmonic-Temporal Attention Network) from scratch...")
-            
-            # 动态计算时间步 T_dim (根据 5秒切片, 16000Hz采样率, 512 hop_length 推算)
+            print("🚀 Initializing HTAN (Harmonic-Temporal Attention Network)...")
             expected_t_dim = int((Params['segment_length'] * Params['sample_rate']) / Params['hop_length']) + 1
             
+            # 2. 将消融开关从 Params 传入，如果 Params 没传，默认设为 True (即 Full Model)
             self.model = HTAN(
                 num_classes=self.num_classes,
                 in_channels=1, 
                 base_channels=32,
                 input_fdim=Params['number_mels'],
-                input_tdim=expected_t_dim
+                input_tdim=expected_t_dim,
+                use_graph=Params.get('use_graph', True),
+                use_prior_mask=Params.get('use_prior_mask', True),
+                use_temporal_encoder=Params.get('use_temporal_encoder', True),
+                use_temporal_attention=Params.get('use_temporal_attention', True)
             )
         else:
             raise ValueError(f"❌ Unsupported model: {model_name}. Please use 'HTAN'.")
@@ -40,13 +40,15 @@ class LitModel(L.LightningModule):
         # ---------------------------------------------------------
         self.criterion = nn.CrossEntropyLoss()
         
-        # 使用 torchmetrics 进行准确率和 AUPRC 的计算
         self.train_acc = Accuracy(task="multiclass", num_classes=self.num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=self.num_classes)
         self.test_acc = Accuracy(task="multiclass", num_classes=self.num_classes)
         
-        # 为了兼容你 demo_light.py 中的 monitor='val_auprc'
         self.val_auprc = AveragePrecision(task="multiclass", num_classes=self.num_classes)
+        
+        # 3. 核心修改：新增 Macro-F1 指标
+        self.val_macro_f1 = F1Score(task="multiclass", num_classes=self.num_classes, average="macro")
+        self.test_macro_f1 = F1Score(task="multiclass", num_classes=self.num_classes, average="macro")
 
     def forward(self, x):
         return self.model(x)
@@ -55,7 +57,6 @@ class LitModel(L.LightningModule):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        
         preds = torch.argmax(logits, dim=1)
         self.train_acc(preds, y)
         
@@ -67,40 +68,39 @@ class LitModel(L.LightningModule):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        
         preds = torch.argmax(logits, dim=1)
-        self.val_acc(preds, y)
         
-        # AUPRC 需要 softmax 后的概率
+        self.val_acc(preds, y)
+        self.val_macro_f1(preds, y) # 计算 Macro-F1
+        
         probs = torch.softmax(logits, dim=1)
         self.val_auprc(probs, y)
         
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_acc', self.val_acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val_auprc', self.val_auprc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_macro_f1', self.val_macro_f1, on_step=False, on_epoch=True, prog_bar=True, logger=True) # 记录 Macro-F1
         return loss
 
     def test_step(self, batch, batch_idx):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        
         preds = torch.argmax(logits, dim=1)
+        
         self.test_acc(preds, y)
+        self.test_macro_f1(preds, y) # 计算 Test Macro-F1
         
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('test_acc', self.test_acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('test_macro_f1', self.test_macro_f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def configure_optimizers(self):
-        # 使用 Adam 优化器，学习率由启动参数传入
         optimizer = torch.optim.Adam(
             self.model.parameters(), 
             lr=self.Params['lr'], 
-            weight_decay=1e-4  # 加入轻微的正则化防止过拟合
+            weight_decay=1e-4 
         )
-        
-        # 加入学习率衰减策略 (ReduceLROnPlateau)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='max', 
@@ -108,12 +108,11 @@ class LitModel(L.LightningModule):
             patience=5, 
             verbose=True
         )
-        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_auprc", # 根据验证集的 AUPRC 来衰减学习率
+                "monitor": "val_macro_f1", # 4. 核心修改：衰减策略基于 Macro-F1
                 "frequency": 1
             },
         }

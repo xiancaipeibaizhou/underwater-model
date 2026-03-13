@@ -1,6 +1,6 @@
-# ShipsEar_dataloader.py
-
 import os
+import json
+import collections
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -28,8 +28,9 @@ class ShipsEarDataset(Dataset):
         return signal, label
 
 class ShipsEarDataModule(L.LightningDataModule):
+    # 【修改点 1】：将 val_test_split 的默认值从 1/3 改为 0.5，实现 70/15/15 划分
     def __init__(self, parent_folder='./Datasets/ShipsEar', batch_size=None, num_workers=8,
-                 train_split=0.7, val_test_split=1/3, random_seed=42, shuffle=False,
+                 train_split=0.7, val_test_split=0.5, random_seed=42, shuffle=False,
                  split_file='shipsear_data_split.txt'):
         super().__init__()
         
@@ -76,51 +77,45 @@ class ShipsEarDataModule(L.LightningDataModule):
                     
         return folder_lists
 
-    def check_data_leakage(self):
+    # 【修改点 2】：新增专属的审计报告生成器
+    def generate_split_audit(self, folder_lists, segment_lists):
         """
-        Checks for data leakage by ensuring that:
-        1. No recording (subfolder) appears in more than one split (train, val, test).
-        2. No segment (file) is duplicated across splits.
+        生成并保存严格的数据划分审计报告 (JSON)，一旦发现泄漏立即抛出异常。
         """
-        try:
-            folder_lists = self.load_splits()
-        except FileNotFoundError:
-            print("Split file not found. Cannot check data leakage.")
-            return
+        audit_report = {
+            "protocol": "Stratified Recording-Level Split (Strict Non-overlapping)",
+            "seed_used": self.random_seed,
+            "train": {"recordings_count": len(folder_lists['train']), "segments_per_class": collections.defaultdict(int)},
+            "val": {"recordings_count": len(folder_lists['val']), "segments_per_class": collections.defaultdict(int)},
+            "test": {"recordings_count": len(folder_lists['test']), "segments_per_class": collections.defaultdict(int)},
+            "leakage_check": "PASSED"
+        }
 
-        splits = ['train', 'val', 'test']
-        recordings = {split: set() for split in splits}
-        segments = {split: set() for split in splits}
+        # 统计各集合中的类别切片分布
+        for split in ['train', 'val', 'test']:
+            for file_path, label in segment_lists[split]:
+                audit_report[split]["segments_per_class"][f"Class_{label}"] += 1
 
-        # Collect all folder paths and segment file names for each split
-        for split in splits:
-            for folder_path, _ in folder_lists[split]:
-                recordings[split].add(folder_path)
-                for root, dirs, files in os.walk(folder_path):
-                    for file in files:
-                        if file.endswith('.wav'):
-                            segments[split].add(file)  # Assuming unique filenames
+        # 致命的数据泄漏校验 (Recording-level 物理隔离检查)
+        train_folders = set([f[0] for f in folder_lists['train']])
+        val_folders = set([f[0] for f in folder_lists['val']])
+        test_folders = set([f[0] for f in folder_lists['test']])
 
-        # **Recording-Level Check**
-        all_recordings = []
-        for split in splits:
-            all_recordings.extend(recordings[split])
-        if len(all_recordings) != len(set(all_recordings)):
-            print("Data leakage detected at the RECORDING level.")
-            return
+        if train_folders.intersection(val_folders) or train_folders.intersection(test_folders) or val_folders.intersection(test_folders):
+            audit_report["leakage_check"] = "FAILED: Overlapping recordings detected across splits!"
+            print("🚨 致命错误：检测到数据泄漏！同一个录音文件出现在了不同的集合中！")
+            
+            # 必须导出泄漏报告留存证据，然后强行中断
+            with open('split_audit_report.json', 'w') as f:
+                json.dump(audit_report, f, indent=4)
+            raise ValueError("Data Leakage Detected at Recording Level! Please check your split generation.")
         else:
-            print("No data leakage detected at the RECORDING level.")
+            print("✅ 数据划分审计通过：Train/Val/Test 实现了严格的录音级别物理隔离。")
 
-        # **Segment-Level Check**
-        all_segments = []
-        for split in splits:
-            all_segments.extend(segments[split])
-        if len(all_segments) != len(set(all_segments)):
-            print("Data leakage detected at the SEGMENT level.")
-        else:
-            print("No data leakage detected at the SEGMENT level.")
+        # 正常导出合规的审计报告
+        with open('split_audit_report.json', 'w') as f:
+            json.dump(audit_report, f, indent=4)
 
-       
     def setup(self, stage=None):
         # Check if split file exists and load it if available
         if os.path.exists(self.split_file):
@@ -130,15 +125,9 @@ class ShipsEarDataModule(L.LightningDataModule):
         else:
             print(f"Creating new splits and saving them to {self.split_file}")
             
-            # Read metadata file (shipsEar.xlsx)
-            metadata_path = os.path.join(self.parent_folder, 'shipsEar.xlsx')
-            metadata = pd.read_excel(metadata_path)
-
             # Get classes in directory (A, B, C, D, E)
             ships_classes = [f.name for f in os.scandir(self.parent_folder) if f.is_dir()]
-
             class_mapping = {ship: idx for idx, ship in enumerate(ships_classes)}
-
             folder_lists = {'train': [], 'test': [], 'val': []}
 
             # Loop over each class and split data into train/val/test sets at recording level (subfolder level)
@@ -188,6 +177,9 @@ class ShipsEarDataModule(L.LightningDataModule):
                             file_path = os.path.join(root, file)
                             segment_lists[split].append((file_path, label))
         
+        # 【修改点 3】：在这里调用审计生成器 (紧接在 segment_lists 填充完毕后，实例化 Dataset 之前)
+        self.generate_split_audit(folder_lists, segment_lists)
+
         # Initialize datasets
         self.train_dataset = ShipsEarDataset(segment_lists['train'])
         self.val_dataset = ShipsEarDataset(segment_lists['val'])
@@ -205,8 +197,6 @@ class ShipsEarDataModule(L.LightningDataModule):
               f"total: {total_recordings}")
 
         print(f"Total number of samples across all splits: {total_samples}\n")
-        
-        self.check_data_leakage()
 
     def train_dataloader(self):
         return DataLoader(
