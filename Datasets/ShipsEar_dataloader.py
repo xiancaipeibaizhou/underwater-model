@@ -8,12 +8,40 @@ import lightning as L
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from scipy.io import wavfile
+import hashlib  # 🌟 新增：用于生成固定的路径哈希种子
+
+# 🌟 新增：严谨的样本级确定性 AWGN 噪声注入函数
+def add_awgn(signal, snr_db, seed_string=None):
+    """根据目标信噪比 (SNR) 注入绝对固定的高斯白噪声"""
+    if snr_db is None:
+        return signal
+        
+    sig_power = np.mean(signal ** 2)
+    if sig_power == 0:
+        return signal
+        
+    snr_linear = 10 ** (snr_db / 10.0)
+    noise_power = sig_power / snr_linear
+
+    # 强制固定随机种子，确保同一个文件无论测多少次，加的噪声波形完全一致
+    if seed_string is not None:
+        seed = int(hashlib.md5(seed_string.encode('utf-8')).hexdigest(), 16) % (2**32)
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState()
+
+    # 生成 float32 格式的噪声，对齐原信号
+    noise = rng.normal(0, np.sqrt(noise_power), len(signal)).astype(np.float32)
+    return signal + noise
+
 
 class ShipsEarDataset(Dataset):
-    def __init__(self, segment_list, target_sr=16000, normalize_waveform=False):
+    # 🌟 修改 1：接收 snr_db 参数
+    def __init__(self, segment_list, target_sr=16000, normalize_waveform=False, snr_db=None):
         self.segment_list = segment_list
         self.target_sr = target_sr
         self.normalize_waveform = normalize_waveform
+        self.snr_db = snr_db
 
     def __len__(self):
         return len(self.segment_list)
@@ -37,6 +65,9 @@ class ShipsEarDataset(Dataset):
         if signal.ndim > 1:
             signal = signal.mean(axis=1)
 
+        # 🌟 修改 2：在此处执行在线加噪，绑定绝对路径作为固定种子
+        signal = add_awgn(signal, self.snr_db, seed_string=file_path)
+
         if self.normalize_waveform:
             max_val = np.max(np.abs(signal))
             if max_val > 0:
@@ -46,9 +77,11 @@ class ShipsEarDataset(Dataset):
 
 
 class ShipsEarDataModule(L.LightningDataModule):
+    # 🌟 修改 3：接收外部传来的 test_snr
     def __init__(self, parent_folder='./Datasets/ShipsEar', batch_size=None, num_workers=8,
                  train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42, 
-                 normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json'):
+                 normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json',
+                 test_snr=None):
         super().__init__()
         
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, "🚨 比例之和必须等于 1.0"
@@ -63,6 +96,7 @@ class ShipsEarDataModule(L.LightningDataModule):
         self.normalize_waveform = normalize_waveform
         self.split_file = split_file
         self.audit_file = audit_file
+        self.test_snr = test_snr # 保存测试集 SNR 配置
         
         self.train_dataset = None
         self.val_dataset = None
@@ -246,11 +280,16 @@ class ShipsEarDataModule(L.LightningDataModule):
         
         self.check_data_leakage(folder_lists, segment_lists)
 
-        self.train_dataset = ShipsEarDataset(segment_lists['train'], normalize_waveform=self.normalize_waveform)
-        self.val_dataset = ShipsEarDataset(segment_lists['val'], normalize_waveform=self.normalize_waveform)
-        self.test_dataset = ShipsEarDataset(segment_lists['test'], normalize_waveform=self.normalize_waveform)
+        # 🌟 修改 4：Train 和 Val 永远保持 Clean (snr_db=None)，只有 Test 集注入配置的噪声
+        self.train_dataset = ShipsEarDataset(segment_lists['train'], normalize_waveform=self.normalize_waveform, snr_db=None)
+        self.val_dataset = ShipsEarDataset(segment_lists['val'], normalize_waveform=self.normalize_waveform, snr_db=None)
+        self.test_dataset = ShipsEarDataset(segment_lists['test'], normalize_waveform=self.normalize_waveform, snr_db=self.test_snr)
 
         self._print_and_verify_distributions(folder_lists, segment_lists, inverse_class_mapping, class_mapping)
+        
+        # 🌟 修改 5：高能预警打印
+        if self.test_snr is not None:
+            print(f"🌪️  [高能预警] 当前测试集已注入固定随机种子的 AWGN 白噪声，信噪比 SNR = {self.test_snr} dB")
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size['train'], num_workers=self.num_workers, shuffle=True, pin_memory=True)

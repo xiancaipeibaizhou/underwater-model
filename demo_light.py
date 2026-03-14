@@ -5,6 +5,7 @@ import lightning as L
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger  # 🌟 新增：论文级轻量化日志记录器
 import os
 
 from Utils.LitModel import LitModel
@@ -18,13 +19,17 @@ def count_trainable_params(model):
 def main(Params):
     model_name = Params['Model_name']
     batch_size = Params['batch_size']
-    t_batch_size = batch_size['train']
     num_workers = Params['num_workers']
     
     if Params['data_selection'] == 1:
         dataset_dir = 'shipsEar_AUDIOS/' 
         Generate_Segments(dataset_dir, target_sr=16000, segment_length=5)
-        data_module = ShipsEarDataModule(parent_folder=dataset_dir, batch_size=batch_size, num_workers=num_workers)
+        data_module = ShipsEarDataModule(
+            parent_folder=dataset_dir, 
+            batch_size=batch_size, 
+            num_workers=num_workers,
+            test_snr=Params.get('test_snr')
+        )
         num_classes = 5 
     else:
         raise ValueError('当前仅支持 ShipsEar 数据集')
@@ -32,38 +37,32 @@ def main(Params):
     DataName = "ShipsEar"
     torch.set_float32_matmul_precision('medium') 
     
-    # ==========================================
-    # SOTA 级功能 1：定义组名 (Group)，严格区分消融变体
-    # ==========================================
-    group_str = f"G{int(Params['use_graph'])}_P{int(Params['use_prior_mask'])}_TE{int(Params['use_temporal_encoder'])}_TA{int(Params['use_temporal_attention'])}"
+    snr_suffix = f"_SNR{Params['test_snr']}" if Params.get('test_snr') is not None else "_Clean"
+    group_str = f"G{int(Params['use_graph'])}_P{int(Params['use_prior_mask'])}_TE{int(Params['use_temporal_encoder'])}_TA{int(Params['use_temporal_attention'])}{snr_suffix}"
     
     print(f'\n🚀 Starting Experiments for {DataName} using {model_name} | Group: {group_str} 🚀')
     
-    # ==========================================
-    # SOTA 级功能 2：准备全局的汇总 CSV 表格
-    # ==========================================
     csv_file = "htan_ablations_results.csv" 
     if not os.path.isfile(csv_file):
         with open(csv_file, "w") as f:
-            f.write("Dataset,Model,Group,Run_Index,Seed,ACC,APR_Weighted,RE_Weighted,F1_Macro,F1_Weighted,Val_Macro_F1\n")
+            f.write("Dataset,Model,ExpTime,Group,Run_Index,Seed,ACC,APR_Weighted,RE_Weighted,F1_Macro,F1_Weighted,Val_Macro_F1\n")
 
-    numRuns = 3
+    numRuns = 1 if Params.get('test_only') else 3
+
     for run_number in range(0, numRuns):
         current_seed = run_number + 42
         seed_everything(current_seed, workers=True) 
         
-        # ==========================================
-        # SOTA 级功能 3：建立像 MILAN 一样的极简本地文件夹
-        # 路径规范：results/ShipsEar/G1_P1_TE1_TA1/Run_0/
-        # ==========================================
-        save_dir = os.path.join("results", DataName, group_str, f"Run_{run_number}")
+        # 🌟 核心修复 2：按时间戳生成独立根目录，彻底杜绝覆盖！
+        exp_folder_name = f"{DataName}_{Params['exp_time']}" if Params.get('exp_time') else DataName
+        save_dir = os.path.join("results", exp_folder_name, group_str, f"Run_{run_number}")
         os.makedirs(save_dir, exist_ok=True)
         
         print(f'\n>>> Starting [ {group_str} ] | Run {run_number+1}/{numRuns} (Seed: {current_seed}) <<<\n')
         print(f'📁 Outputs will be saved strictly to: {save_dir}\n')
     
         checkpoint_callback = ModelCheckpoint(
-            dirpath=save_dir,          # 强制把最佳权重保存在纯净目录下，别乱跑
+            dirpath=save_dir,
             filename='best_model',
             monitor='val_macro_f1', 
             save_top_k=1,
@@ -85,23 +84,31 @@ def main(Params):
             num_params = count_trainable_params(model_wrapper)
             print(f'\n💡 Total Trainable Parameters: {num_params / 1e6:.4f} M\n')
 
+        # 🌟 核心修复 1：引入 CSVLogger 记录每个 Epoch 的 Loss 和 F1 曲线
+        csv_logger = CSVLogger(save_dir=save_dir, name="training_curves")
+
         trainer = L.Trainer(
             max_epochs=Params['num_epochs'],
             callbacks=[early_stopping_callback, checkpoint_callback],
             deterministic=False,
-            logger=False, # 🌟【核心手术】：完全关闭 Lightning 所有自带 Logger，彻底告别 tb_logs！
+            logger=csv_logger, # 👈 重新启用专门为论文准备的 CSV 记录器
             log_every_n_steps=10,
             enable_progress_bar=True,
             accelerator='gpu',       
             devices="auto"
         )
         
-        # 1. 开始训练
-        trainer.fit(model=model_wrapper, datamodule=data_module) 
-        best_val_f1 = checkpoint_callback.best_model_score.item()
-    
-        # 加载刚才存入 save_dir 的最佳权重
-        best_model_path = checkpoint_callback.best_model_path
+        if not Params.get('test_only'):
+            trainer.fit(model=model_wrapper, datamodule=data_module) 
+            best_val_f1 = checkpoint_callback.best_model_score.item()
+            best_model_path = checkpoint_callback.best_model_path
+        else:
+            print(f"\n⚠️ [鲁棒性测试模式] 跳过训练，直接加载 Clean 权重: {Params['ckpt_path']}")
+            if Params.get('ckpt_path') is None or not os.path.exists(Params['ckpt_path']):
+                raise FileNotFoundError(f"🚨 找不到指定的权重文件: {Params.get('ckpt_path')}！请检查路径。")
+            best_model_path = Params['ckpt_path']
+            best_val_f1 = 0.0 
+
         best_model = LitModel.load_from_checkpoint(
             checkpoint_path=best_model_path,
             Params=Params,
@@ -109,20 +116,16 @@ def main(Params):
             num_classes=num_classes,
         )
     
-        # 2. 验证模型 (注入纯净目录，LitModel 会在里面画图)
         best_model.test_save_dir = save_dir
         trainer.test(model=best_model, datamodule=data_module)
         
-        # 获取在 LitModel 内部算好的所有严谨指标
         metrics = best_model.custom_metrics
     
-        # 3. 自动追加写入全局 CSV 表格
         with open(csv_file, "a") as f:
-            f.write(f"{DataName},{model_name},{group_str},{run_number},{current_seed},"
+            f.write(f"{DataName},{model_name},{Params.get('exp_time', 'None')},{group_str},{run_number},{current_seed},"
                     f"{metrics['ACC']:.4f},{metrics['APR_Weighted']:.4f},{metrics['RE_Weighted']:.4f},"
                     f"{metrics['F1_Macro']:.4f},{metrics['F1_Weighted']:.4f},{best_val_f1:.4f}\n")
     
-        # 在文件夹里留一份基础日志证明
         with open(os.path.join(save_dir, "metrics.txt"), "w") as file:
             file.write(f"=== {model_name} ({group_str}) Run {run_number} ===\n")
             file.write(f"Best Validation Macro-F1: {best_val_f1:.4f}\n")
@@ -134,7 +137,6 @@ def parse_args():
     parser.add_argument('--model', type=str, default='HTAN', help='Select baseline model architecture')
     parser.add_argument('--data_selection', type=int, default=1, help='Dataset selection: 1=ShipsEar')
     
-    # 0/1 控制消融，非常严谨
     parser.add_argument('--use_graph', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
     parser.add_argument('--use_prior_mask', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
     parser.add_argument('--use_temporal_encoder', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
@@ -154,17 +156,18 @@ def parse_args():
     parser.add_argument('--number_mels', type=int, default=128, help='number of mels')
     parser.add_argument('--sample_rate', type=int, default=16000, help='Dataset Sample Rate')
     parser.add_argument('--segment_length', type=int, default=5, help='Dataset Segment Length')
-                 
+
+    parser.add_argument('--test_snr', type=float, default=None, help='测试集注入的 SNR (dB)')
+    parser.add_argument('--test_only', action='store_true', help='跳过训练，仅加载权重进行测试')
+    parser.add_argument('--ckpt_path', type=str, default=None, help='仅测试模式下加载的权重路径')             
+    parser.add_argument('--exp_time', type=str, default='', help='按时间戳生成独立文件夹防止覆盖')             
     args = parser.parse_args()
     return args
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    # 彻底抛弃旧的 Demo_Parameters.py，直接把命令行参数转为字典
     params = vars(args).copy()
     
-    # 补充内部逻辑需要的字段映射
     params['Model_name'] = args.model
     params['batch_size'] = {
         'train': args.train_batch_size,
@@ -172,7 +175,6 @@ if __name__ == "__main__":
         'test': args.test_batch_size
     }
     
-    # 确保消融开关是严谨的布尔值
     for key in ['use_graph', 'use_prior_mask', 'use_temporal_encoder', 'use_temporal_attention']:
         params[key] = bool(params[key])
         
