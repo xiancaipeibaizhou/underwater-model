@@ -28,7 +28,7 @@ class MultiScaleConvBlock(nn.Module):
             nn.BatchNorm2d(out_channels // 4),
             nn.ReLU()
         )
-        # 分支4：全局上下文 (Context Branch) - 留作消融实验备选
+        # 分支4：全局上下文 (Context Branch)
         self.branch4_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Conv2d(in_channels, out_channels // 4, kernel_size=1),
@@ -62,6 +62,7 @@ class HarmonicFrequencyGCN(nn.Module):
         super().__init__()
         self.num_freq_bins = num_freq_bins  
         self.in_channels = in_channels
+        self.use_prior_mask = True # 默认开启，由外部 HTAN 动态控制
         
         self.register_buffer('A_prior', self._build_harmonic_prior(sr, fmin, fmax))
         
@@ -72,7 +73,6 @@ class HarmonicFrequencyGCN(nn.Module):
         self.dropout = nn.Dropout(0.3)
 
     def _build_harmonic_prior(self, sr, fmin, fmax, tol=0.2):
-        """生成物理启发的频率结构先验矩阵"""
         mel_min = 2595 * np.log10(1 + fmin / 700)
         mel_max = 2595 * np.log10(1 + fmax / 700)
         mels = np.linspace(mel_min, mel_max, self.num_freq_bins)
@@ -85,7 +85,7 @@ class HarmonicFrequencyGCN(nn.Module):
                     A[i, j] = 1.0
                     continue
                 
-                # 【改进点 1】：引入局部频带连续性偏置
+                # 局部频带连续性偏置
                 if abs(i - j) == 1:
                     A[i, j] = max(A[i, j].item(), 0.3)
                     A[j, i] = max(A[j, i].item(), 0.3)
@@ -108,8 +108,10 @@ class HarmonicFrequencyGCN(nn.Module):
         K = self.key(x)    
         A_logits = torch.bmm(Q, K.transpose(1, 2)) / (K.shape[-1] ** 0.5)
         
-        prior_mask = (self.A_prior > 0).unsqueeze(0).expand(B_T, -1, -1)
-        A_logits = A_logits.masked_fill(~prior_mask, -1e9)
+        # 物理先验掩码开关
+        if getattr(self, 'use_prior_mask', True):
+            prior_mask = (self.A_prior > 0).unsqueeze(0).expand(B_T, -1, -1)
+            A_logits = A_logits.masked_fill(~prior_mask, -1e9)
         
         A_dynamic = F.softmax(A_logits, dim=-1)
         A_dynamic = self.dropout(A_dynamic)
@@ -139,12 +141,20 @@ class TemporalAttention(nn.Module):
         return global_feat, attn_weights
 
 # ------------------------------------------------------------
-# 4. 最终主模型：HTAN (Harmonic-Temporal Attention Network)
+# 4. 最终主模型：HTAN (包含完善的消融开关逻辑)
 # ------------------------------------------------------------
 class HTAN(nn.Module):
     def __init__(self, num_classes=5, in_channels=1, base_channels=32, 
-                 input_fdim=128, input_tdim=1024):
+                 input_fdim=128, input_tdim=1024,
+                 use_graph=True, use_prior_mask=True,
+                 use_temporal_encoder=True, use_temporal_attention=True):
         super().__init__()
+        
+        # 记录消融开关状态
+        self.use_graph = use_graph
+        self.use_prior_mask = use_prior_mask
+        self.use_temporal_encoder = use_temporal_encoder
+        self.use_temporal_attention = use_temporal_attention
         
         self.frontend = nn.Sequential(
             MultiScaleConvBlock(in_channels, base_channels),      
@@ -152,25 +162,27 @@ class HTAN(nn.Module):
             MultiScaleConvBlock(base_channels*2, base_channels*4) 
         )
         
-        # 【改进点 2】：使用 Dummy Tensor 动态推导输出尺寸，彻底告别写死的尺寸计算
+        # 动态推导输出尺寸
         with torch.no_grad():
             dummy_input = torch.zeros(1, in_channels, input_fdim, input_tdim)
             dummy_out = self.frontend(dummy_input)
             _, cnn_out_c, f_out, t_out = dummy_out.shape
             
+        # 始终初始化，避免 DDP 报错，但前向传播时决定是否使用
         self.harmonic_gcn = HarmonicFrequencyGCN(
             in_channels=cnn_out_c, 
             num_freq_bins=f_out,
             sr=16000, fmin=0, fmax=8000 
         )
+        self.harmonic_gcn.use_prior_mask = self.use_prior_mask
         
-        gru_input_size = cnn_out_c * 2
+        # 如果使用图网络，通道由于 mean+max 拼接会翻倍
+        gru_input_size = cnn_out_c * 2 if self.use_graph else cnn_out_c
         
-        # 【改进点 3】：将 num_layers 降为 1，确保后端真正轻量级
         self.temporal_encoder = nn.GRU(
             input_size=gru_input_size, 
             hidden_size=gru_input_size // 2, 
-            num_layers=1,  # 1-layer BiGRU
+            num_layers=1,  
             batch_first=True, 
             bidirectional=True
         )
@@ -187,16 +199,29 @@ class HTAN(nn.Module):
         x = self.frontend(x)  
         B, C, F_out, T_out = x.shape
         
-        x = x.permute(0, 3, 2, 1).contiguous().view(B * T_out, F_out, C)
-        x = self.harmonic_gcn(x)
+        # --- 模块 1：图网络开关 ---
+        if self.use_graph:
+            x = x.permute(0, 3, 2, 1).contiguous().view(B * T_out, F_out, C)
+            x = self.harmonic_gcn(x)
+            
+            x = x.view(B, T_out, F_out, C)
+            x_mean = x.mean(dim=2)          
+            x_max = x.max(dim=2).values     
+            x = torch.cat([x_mean, x_max], dim=-1) # [B, T, 2*C]
+        else:
+            # 仅做全局频率平均 [B, T, C]
+            x = x.mean(dim=2).transpose(1, 2) 
         
-        x = x.view(B, T_out, F_out, C)
-        x_mean = x.mean(dim=2)          
-        x_max = x.max(dim=2).values     
-        x = torch.cat([x_mean, x_max], dim=-1) 
-        
-        x, _ = self.temporal_encoder(x) 
-        x, attn_weights = self.temporal_attention(x) 
+        # --- 模块 2：时序编码开关 ---
+        if self.use_temporal_encoder:
+            x, _ = self.temporal_encoder(x) 
+            
+        # --- 模块 3：帧级注意力开关 ---
+        if self.use_temporal_attention:
+            x, attn_weights = self.temporal_attention(x) 
+        else:
+            # 全局时间平均池化
+            x = x.mean(dim=1)
         
         logits = self.classifier(x)
         return logits

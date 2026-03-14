@@ -1,98 +1,85 @@
-# Physics-Inspired Underwater Acoustic Target Recognition (UATR)
+# Histogram-based Parameter-efficient Tuning for Passive and Active Sonar Classification
+<p align="center">
+  <img src="Figures/Workflow.png" alt="Workflow Diagram">
+</p>
 
-This repository contains the official PyTorch implementation for our proposed **HTAN (Harmonic-Temporal Attention Network)**.
 
-Designed specifically for the challenging underwater acoustic environment, HTAN presents a compact and physics-inspired framework for underwater acoustic target recognition. By integrating acoustic physical priors into a data-driven framework, HTAN aims to provide an effective recognition approach that is trained entirely from scratch, without relying on parameter-heavy generic pre-trained backbones.
+Amirmohammad Mohammadi, Davelle Carreiro, Alexandra Van Dine and Joshua Peeples
 
-## 🚀 Key Innovations
+If this code is used, please cite it. (2025, March): Initial Release (Version v1.0). 
 
-1. **Multi-Scale Contextual Frontend:** Parallel local, spectral, and temporal convolutional branches are designed to capture both transient cavitation impulses (broadband) and continuous mechanical line spectra (narrowband).
-2. **Harmonic Frequency GCN:** We introduce a *physics-inspired frequency prior* to mask the dynamic graph attention. This prior guides the network to emphasize harmonic-consistent frequency relations and suppress implausible cross-band interactions, rather than relying solely on data-driven attention.
-3. **Temporal Attention Pooling:** A 1-layer BiGRU paired with a frame-level attention mechanism aggregates informative acoustic events across the time dimension.
-4. **Compact Architecture:** Trained entirely from scratch, the model possesses fewer than 1.5 million parameters. Its compact parameterization makes it a promising candidate for resource-constrained deployment scenarios, such as Underwater Acoustic Sensor Networks (UASNs).
+[arXiv](https://arxiv.org/abs/2504.15214)
 
-## 📂 Repository Structure
+### Zenodo archive
 
-    .
-    ├── Datasets/
-    │   ├── ShipsEar_Data_Preprocessing.py  # 16kHz resampling & 5s segmentation
-    │   └── ShipsEar_dataloader.py          # PyTorch Lightning DataModule
-    ├── src/
-    │   └── models/
-    │       └── custom_model.py             # Core implementation of HTAN (Network Architecture)
-    ├── Utils/
-    │   ├── LitModel.py                     # LightningModule wrapper (Train/Val/Test logic & Metrics)
-    │   └── LogMelFilterBank.py             # Acoustic Feature Extraction (Log Mel Spectrogram)
-    ├── demo_light.py                       # Main training and evaluation script
-    ├── Demo_Parameters.py                  # Hyperparameter configurations
-    ├── requirements.txt                    # Python dependencies
-    └── README.md                           # Project documentation
+[`Zenodo`](https://doi.org/10.5281/zenodo.15263760). https://zenodo.org/records/15263760  
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15263760.svg)](https://doi.org/10.5281/zenodo.15263760)
 
-## ⚙️ Installation & Environment Setup
+## Installation Prerequisites
 
-Ensure you have Python 3.8+ installed. We highly recommend using a virtual environment (e.g., Conda). Install the required dependencies:
+The [`requirements.txt`](requirements.txt) file includes all the necessary packages, and the packages will be installed using:
 
-    pip install -r requirements.txt
+   ```pip install -r requirements.txt```
 
-*(Note: Ensure `torch`, `lightning`, `librosa`, and `torchmetrics` are properly installed and compatible with your CUDA version for GPU acceleration).*
+Or, for a more convenient option, a pre-configured environment is available for download through the provided link. This environment comes with all the essential packages already installed.
 
-## 📊 Dataset Preparation & Evaluation Protocol
+[`Download environment`](https://drive.google.com/file/d/1dUvjjK3ImNZJP6jZuAlMhulKfijVkM8K/view?usp=sharing)
 
-We utilize the widely recognized public **ShipsEar** dataset.
+## Demo
 
-1. Download the raw audio files from the official ShipsEar repository.
-2. Place the audio files into folders `A`, `B`, `C`, `D`, and `E` corresponding to their respective vessel classes inside a root directory named `shipsEar_AUDIOS/`.
-3. The preprocessing script (`ShipsEar_Data_Preprocessing.py`) performs 16 kHz resampling and non-overlapping 5-second segmentation.
+To get started, please follow the instructions in the [Datasets](Datasets) folder to download the DeepShip dataset.
+Next, run [`demo.py`](demo.py) in Python IDE (e.g., Spyder) or command line to train, validate, and test models. 
 
-**⚠️ Evaluation Protocol (Crucial for preventing data leakage):**
-To ensure rigorous evaluation and prevent data leakage, train/validation/test splits **must be created at the recording level** rather than randomly splitting over segments. Splitting segments randomly across sets can lead to adjacent segments from the same continuous recording appearing in both training and testing sets, artificially inflating performance. Please ensure your `split_indices.txt` reflects a recording-level split.
 
-## 🏃‍♂️ How to Run
+## Inventory
 
-To train the HTAN model from scratch, execute the main script.
-We recommend using a batch size of `64` and an initial learning rate of `1e-3` for training from scratch.
+```
+https://github.com/Peeples-Lab/HLAST_DeepShip_ParameterEfficient 
 
-    python demo_light.py \
-        --model HTAN \
-        --data_selection 1 \
-        --train_batch_size 64 \
-        --lr 1e-3 \
-        --num_epochs 100 \
-        --audio_feature LogMelFBank \
-        --number_mels 128
+└── root directory
+    ├── demo_light.py                     // Main demo file.
+    ├── Demo_Parameters.py                // Parameter file for the demo.
+    ├── plot_curves.py                    // Run this after the demo to view learning curves. 
+    ├── feature_similarity_analysis.py    // Run this after the demo to view feature similarites, PLEASE set the parameters accordingly. 
+    └── Datasets                
+        ├── Get_Preprocessed_Data.py       // Generate segments for the DeepShip dataset.
+        └── SSDataModule.py                // Data Module for the DeepShip dataset.
+        ├── ShipsEar_Data_Preprocessing.py // Generate segments for the ShipsEar dataset.
+        └── ShipsEar_dataloader.py         // Data Module for the ShipsEar dataset.
+        ├── Create_Combined_VTUAD.py 	   // Merge the three distinct scenarios into one for the VTUAD dataset.
+        └── VTUAD_DataModule.py            // Data Module for the VTUAD dataset.
+        └── fls_datamodule.py              // FLS (forward-looking sonar) vision DataModule.
+    └── Utils                     
+        ├── LitModel.py                    // Lightning Module for the the model.
+        ├── Network_functions.py           // Contains functions to initialize the model.
+        ├── LogMelFilterBank.py            // Log Mel Filter Bank Feature.
+        └── Feature_Extraction_Layer.py    // Extract and transform features from the audio files.
+    └── src
+    	└── models              
+		├── ast_base.py            // AST Original Model
+		├── ast_linear_probe.py    // AST Linear Probing
+		├── ast_adapter.py         // AST with Adapter Layers
+		├── RBFHistogramPooling.py // Create the Histogram Layer
+		└── ast_histogram.py       // AST with Histogram Layers (HPT)
 
-### Monitoring Training
-This project integrates PyTorch Lightning's TensorBoard logger. You can monitor the training progress, validation accuracy (`val_acc`), and Area Under the Precision-Recall Curve (`val_auprc`) in real-time by running:
+```
 
-    tensorboard --logdir=tb_logs/
+## License
 
-## 🔬 Ablation Studies (For Paper Validation)
+This source code is licensed under the license found in the [`LICENSE`](LICENSE) file in the root directory of this source tree.
 
-To validate the acoustic physical assumptions proposed in our paper, you can conduct ablation studies. We recommend implementing parameter switches in your configuration to easily toggle these features:
+This product is Copyright (c) 2025 A. Mohammadi, D. Carreiro, A. Dine and J. Peeples. All rights reserved.
 
-- **w/o Physics Prior (Pure Data-Driven Graph):** Disable the prior masking step in `HarmonicFrequencyGCN.forward()` (e.g., set a `use_prior_mask=False` flag).
-- **w/o Temporal Evolution:** Replace the `BiGRU` temporal encoder with a simple temporal mean pooling operation (e.g., set a `use_temporal_encoder=False` flag).
-- **w/o Multi-Scale Frontend:** Remove `branch2` (1x7) and `branch3` (7x1) in the `MultiScaleConvBlock`, reverting it to a standard local CNN.
-- **w/o Context Branch:** Disable `branch4_pool` to evaluate the impact of the lightweight global SE-style context bias (e.g., set a `use_context_branch=False` flag).
+## Citation
 
-## 📈 Results (Placeholder)
+If you use this work, please cite:
 
-*(Fill this section with your final experimental results to provide a quick overview of model performance.)*
+### arXiv preprint
 
-| Model Variant | Params (M) | FLOPs (G) | Accuracy (%) | Macro-F1 (%) |
-| :--- | :---: | :---: | :---: | :---: |
-| Baseline (AST Fine-tuned) | ~86.0 | - | - | - |
-| HTAN (w/o Prior Mask) | ~1.5 | - | - | - |
-| HTAN (Full) | ~1.5 | - | **XX.X** | **XX.X** |
-
----
-## 📄 Citation
-
-*If you find this code or our physics-inspired methodology helpful in your research, please consider citing our work:*
-
-    @article{YourName2026HTAN,
-      title={Robust Underwater Acoustic Target Recognition with Physics-Inspired Harmonic-Temporal Attention Network},
-      author={Your Name and Co-authors},
-      journal={TBD (e.g., Ocean Engineering / IEEE JOE)},
-      year={2026}
-    }
+```bibtex
+@article{amir2025histogram,
+  title={Histogram-based Parameter-efficient Tuning for Passive Sonar Classification},
+  author={Mohammadi, Amirmohammad and Carreiro, Davelle and Van Dine, Alexandra and Peeples, Joshua},
+  journal={arXiv preprint arXiv:2504.15214},
+  year={2025}
+}

@@ -1,0 +1,90 @@
+{
+    "timestamp": "2026-03-14T16:42:39.763967",
+    "class_mapping": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "E": 4
+    },
+    "splits": {
+        "train": {
+            "total_recordings": 52,
+            "total_segments": 1422,
+            "class_distribution": {
+                "A": {
+                    "recordings": 9,
+                    "segments": 203
+                },
+                "B": {
+                    "recordings": 11,
+                    "segments": 195
+                },
+                "C": {
+                    "recordings": 18,
+                    "segments": 584
+                },
+                "D": {
+                    "recordings": 7,
+                    "segments": 299
+                },
+                "E": {
+                    "recordings": 7,
+                    "segments": 141
+                }
+            }
+        },
+        "val": {
+            "total_recordings": 18,
+            "total_segments": 400,
+            "class_distribution": {
+                "A": {
+                    "recordings": 3,
+                    "segments": 49
+                },
+                "B": {
+                    "recordings": 4,
+                    "segments": 64
+                },
+                "C": {
+                    "recordings": 6,
+                    "segments": 149
+                },
+                "D": {
+                    "recordings": 2,
+                    "segments": 74
+                },
+                "E": {
+                    "recordings": 3,
+                    "segments": 64
+                }
+            }
+        },
+        "test": {
+            "total_recordings": 20,
+            "total_segments": 401,
+            "class_distribution": {
+                "A": {
+                    "recordings": 4,
+                    "segments": 88
+                },
+                "B": {
+                    "recordings": 4,
+                    "segments": 42
+                },
+                "C": {
+                    "recordings": 6,
+                    "segments": 110
+                },
+                "D": {
+                    "recordings": 3,
+                    "segments": 113
+                },
+                "E": {
+                    "recordings": 3,
+                    "segments": 48
+                }
+            }
+        }
+    }
+}

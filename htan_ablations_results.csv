@@ -1,0 +1,2 @@
+Dataset,Model,Group,Run_Index,Seed,ACC,APR_Weighted,RE_Weighted,F1_Macro,F1_Weighted,Val_Macro_F1
+ShipsEar,HTAN,G1_P1_TE1_TA1,0,42,0.7082,0.7243,0.7082,0.7427,0.7131,0.5555

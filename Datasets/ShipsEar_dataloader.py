@@ -1,17 +1,19 @@
 import os
 import json
 import collections
-import pandas as pd
+from datetime import datetime
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 import torch
 import lightning as L
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 from scipy.io import wavfile
 
 class ShipsEarDataset(Dataset):
-    def __init__(self, segment_list):
+    def __init__(self, segment_list, target_sr=16000, normalize_waveform=False):
         self.segment_list = segment_list
+        self.target_sr = target_sr
+        self.normalize_waveform = normalize_waveform
 
     def __len__(self):
         return len(self.segment_list)
@@ -19,203 +21,244 @@ class ShipsEarDataset(Dataset):
     def __getitem__(self, idx):
         file_path, label = self.segment_list[idx]
         
-        # Load the audio signal
-        sample_rate, signal = wavfile.read(file_path)
-        signal = torch.tensor(signal, dtype=torch.float)
-        
-        label = torch.tensor(label, dtype=torch.long)
+        try:
+            sample_rate, signal = wavfile.read(file_path)
+        except Exception as e:
+            raise RuntimeError(f"🚨 读取音频文件失败: {file_path}. 详情: {e}")
 
-        return signal, label
+        if sample_rate != self.target_sr:
+            raise ValueError(f"🚨 采样率异常！期望 {self.target_sr}Hz, 但文件是 {sample_rate}Hz。")
+        
+        if len(signal) == 0:
+            raise ValueError(f"🚨 发现空音频文件: {file_path}")
+
+        signal = signal.astype(np.float32)
+        
+        if signal.ndim > 1:
+            signal = signal.mean(axis=1)
+
+        if self.normalize_waveform:
+            max_val = np.max(np.abs(signal))
+            if max_val > 0:
+                signal = signal / max_val
+
+        return torch.tensor(signal, dtype=torch.float), torch.tensor(label, dtype=torch.long)
+
 
 class ShipsEarDataModule(L.LightningDataModule):
-    # 【修改点 1】：将 val_test_split 的默认值从 1/3 改为 0.5，实现 70/15/15 划分
     def __init__(self, parent_folder='./Datasets/ShipsEar', batch_size=None, num_workers=8,
-                 train_split=0.7, val_test_split=0.5, random_seed=42, shuffle=False,
-                 split_file='shipsear_data_split.txt'):
+                 train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42, 
+                 normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json'):
         super().__init__()
         
+        assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, "🚨 比例之和必须等于 1.0"
+        
         self.batch_size = batch_size or {'train': 64, 'val': 64, 'test': 64}
-
         self.parent_folder = parent_folder
-        self.train_split = train_split
-        self.val_test_split = val_test_split
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.test_ratio = test_ratio
         self.num_workers = num_workers
         self.random_seed = random_seed
-        self.shuffle = shuffle
-        
-        # File to save/load splits
+        self.normalize_waveform = normalize_waveform
         self.split_file = split_file
+        self.audit_file = audit_file
         
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
-        
-    def save_splits(self, folder_lists):
-        """Save train/val/test splits to a text file."""
-        with open(self.split_file, 'w') as f:
-            for split in ['train', 'val', 'test']:
-                f.write(f"{split}:\n")
-                for folder_path, label in folder_lists[split]:
-                    f.write(f"{folder_path},{label}\n")
-                    
-    def load_splits(self):
-        """Load train/val/test splits from a text file."""
-        folder_lists = {'train': [], 'val': [], 'test': []}
-        
+
+    def _verify_and_load_split(self, current_class_mapping):
         if not os.path.exists(self.split_file):
-            raise FileNotFoundError(f"Split file {self.split_file} does not exist!")
-        
-        with open(self.split_file, 'r') as f:
-            current_split = None
-            for line in f:
-                line = line.strip()
-                if line.endswith(':'):
-                    current_split = line[:-1]
-                else:
-                    folder_path, label = line.split(',')
-                    folder_lists[current_split].append((folder_path, int(label)))
-                    
-        return folder_lists
-
-    # 【修改点 2】：新增专属的审计报告生成器
-    def generate_split_audit(self, folder_lists, segment_lists):
-        """
-        生成并保存严格的数据划分审计报告 (JSON)，一旦发现泄漏立即抛出异常。
-        """
-        audit_report = {
-            "protocol": "Stratified Recording-Level Split (Strict Non-overlapping)",
-            "seed_used": self.random_seed,
-            "train": {"recordings_count": len(folder_lists['train']), "segments_per_class": collections.defaultdict(int)},
-            "val": {"recordings_count": len(folder_lists['val']), "segments_per_class": collections.defaultdict(int)},
-            "test": {"recordings_count": len(folder_lists['test']), "segments_per_class": collections.defaultdict(int)},
-            "leakage_check": "PASSED"
-        }
-
-        # 统计各集合中的类别切片分布
-        for split in ['train', 'val', 'test']:
-            for file_path, label in segment_lists[split]:
-                audit_report[split]["segments_per_class"][f"Class_{label}"] += 1
-
-        # 致命的数据泄漏校验 (Recording-level 物理隔离检查)
-        train_folders = set([f[0] for f in folder_lists['train']])
-        val_folders = set([f[0] for f in folder_lists['val']])
-        test_folders = set([f[0] for f in folder_lists['test']])
-
-        if train_folders.intersection(val_folders) or train_folders.intersection(test_folders) or val_folders.intersection(test_folders):
-            audit_report["leakage_check"] = "FAILED: Overlapping recordings detected across splits!"
-            print("🚨 致命错误：检测到数据泄漏！同一个录音文件出现在了不同的集合中！")
+            return None
             
-            # 必须导出泄漏报告留存证据，然后强行中断
-            with open('split_audit_report.json', 'w') as f:
-                json.dump(audit_report, f, indent=4)
-            raise ValueError("Data Leakage Detected at Recording Level! Please check your split generation.")
-        else:
-            print("✅ 数据划分审计通过：Train/Val/Test 实现了严格的录音级别物理隔离。")
+        try:
+            with open(self.split_file, 'r') as f:
+                data = json.load(f)
+                
+            meta = data.get('metadata', {})
+            
+            if meta.get('random_seed') != self.random_seed: return None
+            if meta.get('train_ratio') != self.train_ratio: return None
+            if meta.get('val_ratio') != self.val_ratio: return None
+            if meta.get('test_ratio') != self.test_ratio: return None
+            if meta.get('parent_folder') != self.parent_folder: return None
+            if meta.get('class_mapping') != current_class_mapping: return None
+            
+            print(f"✅ 校验通过：成功复用历史切分文件 ({meta.get('timestamp')})")
+            return data.get('folder_lists')
+            
+        except Exception as e:
+            print(f"⚠️ 解析切分文件失败 ({e})，将重新生成...")
+            return None
 
-        # 正常导出合规的审计报告
-        with open('split_audit_report.json', 'w') as f:
-            json.dump(audit_report, f, indent=4)
+    def save_splits(self, folder_lists, class_mapping):
+        data = {
+            "metadata": {
+                "timestamp": datetime.now().isoformat(),
+                "protocol": "Class-wise Recording-level Split",
+                "random_seed": self.random_seed,
+                "train_ratio": self.train_ratio,
+                "val_ratio": self.val_ratio,
+                "test_ratio": self.test_ratio,
+                "parent_folder": self.parent_folder,
+                "class_mapping": class_mapping,
+                "shuffle": True 
+            },
+            "folder_lists": folder_lists
+        }
+        with open(self.split_file, 'w') as f:
+            json.dump(data, f, indent=4)
+
+    def check_data_leakage(self, folder_lists, segment_lists):
+        splits = ['train', 'val', 'test']
+        recordings = {split: set() for split in splits}
+        segments = {split: set() for split in splits}
+
+        for split in splits:
+            for folder_path, _ in folder_lists[split]:
+                recordings[split].add(os.path.abspath(folder_path))
+            for file_path, _ in segment_lists[split]:
+                segments[split].add(os.path.abspath(file_path))
+
+        if recordings['train'].intersection(recordings['val']) or \
+           recordings['train'].intersection(recordings['test']) or \
+           recordings['val'].intersection(recordings['test']):
+            raise ValueError("🚨 数据泄漏！Train/Val/Test 之间存在 Recording 级别的重叠！")
+
+        if segments['train'].intersection(segments['val']) or \
+           segments['train'].intersection(segments['test']) or \
+           segments['val'].intersection(segments['test']):
+            raise ValueError("🚨 数据泄漏！Train/Val/Test 之间存在 Segment 绝对路径的重叠！")
+
+    def _print_and_verify_distributions(self, folder_lists, segment_lists, inverse_class_mapping, class_mapping):
+        splits = ['train', 'val', 'test']
+        num_classes = len(inverse_class_mapping)
+        
+        audit_data = {
+            "timestamp": datetime.now().isoformat(),
+            "class_mapping": class_mapping,
+            "splits": {}
+        }
+        
+        print("\n" + "="*75)
+        print("📊 数据集全局划分与类分布审计报告 (Recording & Segment Level)")
+        print("="*75)
+        print(f"🗺️  类别映射: {class_mapping}")
+        print("-" * 75)
+
+        for split in splits:
+            print(f"[{split.upper():^5} SET]")
+            rec_counts = collections.Counter([label for _, label in folder_lists[split]])
+            seg_counts = collections.Counter([label for _, label in segment_lists[split]])
+            
+            total_recs = sum(rec_counts.values())
+            total_segs = sum(seg_counts.values())
+            
+            audit_data["splits"][split] = {
+                "total_recordings": total_recs,
+                "total_segments": total_segs,
+                "class_distribution": {}
+            }
+            
+            print(f"总计 -> Recordings: {total_recs:<4} | Segments: {total_segs}")
+            
+            for class_idx in range(num_classes):
+                c_name = inverse_class_mapping[class_idx]
+                c_rec = rec_counts.get(class_idx, 0)
+                c_seg = seg_counts.get(class_idx, 0)
+                
+                if c_rec == 0 or c_seg == 0:
+                    raise AssertionError(f"🚨 数据失衡: {split.upper()} 集中, 类别 [{c_name}] 数量为 0！")
+
+                rec_pct = (c_rec / total_recs) * 100 if total_recs > 0 else 0
+                seg_pct = (c_seg / total_segs) * 100 if total_segs > 0 else 0
+                
+                audit_data["splits"][split]["class_distribution"][c_name] = {
+                    "recordings": c_rec,
+                    "segments": c_seg
+                }
+                
+                print(f" Class {c_name:<2} (ID:{class_idx}) | "
+                      f"Recs: {c_rec:>3} ({rec_pct:>5.1f}%) | "
+                      f"Segs: {c_seg:>4} ({seg_pct:>5.1f}%)")
+            print("-" * 75)
+            
+        with open(self.audit_file, 'w') as f:
+            json.dump(audit_data, f, indent=4)
+        print(f"💾 审计报告已保存至: {self.audit_file}")
+        print("="*75 + "\n")
 
     def setup(self, stage=None):
-        # Check if split file exists and load it if available
-        if os.path.exists(self.split_file):
-            print(f"\nLoading splits from {self.split_file}")
-            folder_lists = self.load_splits()
-        
-        else:
-            print(f"Creating new splits and saving them to {self.split_file}")
-            
-            # Get classes in directory (A, B, C, D, E)
-            ships_classes = [f.name for f in os.scandir(self.parent_folder) if f.is_dir()]
-            class_mapping = {ship: idx for idx, ship in enumerate(ships_classes)}
+        ships_classes = sorted([f.name for f in os.scandir(self.parent_folder) if f.is_dir()])
+        class_mapping = {ship: idx for idx, ship in enumerate(ships_classes)}
+        inverse_class_mapping = {idx: ship for ship, idx in class_mapping.items()}
+
+        folder_lists = self._verify_and_load_split(class_mapping)
+
+        if folder_lists is None:
+            print(f"🚀 正在基于比例 {self.train_ratio}:{self.val_ratio}:{self.test_ratio} 生成 Class-wise Recording-level Split...")
             folder_lists = {'train': [], 'test': [], 'val': []}
 
-            # Loop over each class and split data into train/val/test sets at recording level (subfolder level)
             for label in ships_classes:
                 label_path = os.path.join(self.parent_folder, label)
-                subfolders = os.listdir(label_path)
+                subfolders = sorted([f.name for f in os.scandir(label_path) if f.is_dir()])
+                
+                n_total = len(subfolders)
+                
+                n_train = int(n_total * self.train_ratio)
+                n_val_test = n_total - n_train
+                relative_val_ratio = self.val_ratio / (self.val_ratio + self.test_ratio)
+                n_val = int(n_val_test * relative_val_ratio)
+                n_test = n_val_test - n_val
+                
+                if n_train == 0 or n_val == 0 or n_test == 0:
+                    raise ValueError(
+                        f"🚨 致命冲突: 类别 [{label}] 的物理录音数 ({n_total}) 无法满足 "
+                        f"{self.train_ratio}:{self.val_ratio}:{self.test_ratio} 的划分！"
+                    )
 
-                # Split subfolders into training and test/validation sets
-                subfolders_train, subfolders_test_val = train_test_split(
-                    subfolders,
-                    train_size=self.train_split,
-                    shuffle=self.shuffle,
-                    random_state=self.random_seed,
+                subfolders_train, subfolders_val_test = train_test_split(
+                    subfolders, train_size=self.train_ratio, shuffle=True, random_state=self.random_seed
                 )
 
-                # Split test/validation set further into test and validation sets
-                subfolders_test, subfolders_val = train_test_split(
-                    subfolders_test_val,
-                    test_size=self.val_test_split,
-                    shuffle=self.shuffle,
-                    random_state=self.random_seed,
+                subfolders_val, subfolders_test = train_test_split(
+                    subfolders_val_test, train_size=relative_val_ratio, shuffle=True, random_state=self.random_seed
                 )
 
-                # Add subfolders to appropriate folder list with their class labels
                 for subfolder in subfolders_train:
-                    folder_lists['train'].append((os.path.join(label_path, subfolder), class_mapping[label]))
-
-                for subfolder in subfolders_test:
-                    folder_lists['test'].append((os.path.join(label_path, subfolder), class_mapping[label]))
-
+                    folder_lists['train'].append([os.path.join(label_path, subfolder), class_mapping[label]])
                 for subfolder in subfolders_val:
-                    folder_lists['val'].append((os.path.join(label_path, subfolder), class_mapping[label]))
+                    folder_lists['val'].append([os.path.join(label_path, subfolder), class_mapping[label]])
+                for subfolder in subfolders_test:
+                    folder_lists['test'].append([os.path.join(label_path, subfolder), class_mapping[label]])
             
-            # Save splits to a text file for future use.
-            self.save_splits(folder_lists)
+            self.save_splits(folder_lists, class_mapping)
 
         segment_lists = {'train': [], 'test': [], 'val': []}
-        recording_counts = {split: len(folder_lists[split]) for split in ['train', 'val', 'test']}
-        total_recordings = sum(recording_counts.values())
-        
-        # Loop over each partition and gather all segments (files) within each folder
         for split in ['train', 'test', 'val']:
             for folder_path, label in folder_lists[split]:
-                for root, dirs, files in os.walk(folder_path):
-                    for file in files:
-                        if file.endswith('.wav'):
-                            file_path = os.path.join(root, file)
+                for file in sorted(os.listdir(folder_path)):
+                    if file.endswith('.wav'):
+                        file_path = os.path.join(folder_path, file)
+                        if os.path.isfile(file_path):
                             segment_lists[split].append((file_path, label))
         
-        # 【修改点 3】：在这里调用审计生成器 (紧接在 segment_lists 填充完毕后，实例化 Dataset 之前)
-        self.generate_split_audit(folder_lists, segment_lists)
+        self.check_data_leakage(folder_lists, segment_lists)
 
-        # Initialize datasets
-        self.train_dataset = ShipsEarDataset(segment_lists['train'])
-        self.val_dataset = ShipsEarDataset(segment_lists['val'])
-        self.test_dataset = ShipsEarDataset(segment_lists['test'])
+        self.train_dataset = ShipsEarDataset(segment_lists['train'], normalize_waveform=self.normalize_waveform)
+        self.val_dataset = ShipsEarDataset(segment_lists['val'], normalize_waveform=self.normalize_waveform)
+        self.test_dataset = ShipsEarDataset(segment_lists['test'], normalize_waveform=self.normalize_waveform)
 
-        total_samples = (len(self.train_dataset) +len(self.val_dataset) +len(self.test_dataset))
-                         
-        print(f"\nNumber of training samples: {len(self.train_dataset)}")
-        print(f"Number of validation samples: {len(self.val_dataset)}")
-        print(f"Number of test samples: {len(self.test_dataset)}\n")
-        
-        print(f"\nRecording folders  – train: {recording_counts['train']}, "
-              f"val: {recording_counts['val']}, "
-              f"test: {recording_counts['test']}, "
-              f"total: {total_recordings}")
-
-        print(f"Total number of samples across all splits: {total_samples}\n")
+        self._print_and_verify_distributions(folder_lists, segment_lists, inverse_class_mapping, class_mapping)
 
     def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size['train'],
-            num_workers=self.num_workers,
-            shuffle=True
-        )
+        return DataLoader(self.train_dataset, batch_size=self.batch_size['train'], num_workers=self.num_workers, shuffle=True, pin_memory=True)
 
     def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size['val'],
-            num_workers=self.num_workers
-        )
+        return DataLoader(self.val_dataset, batch_size=self.batch_size['val'], num_workers=self.num_workers, pin_memory=True)
 
     def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size['test'],
-            num_workers=self.num_workers
-        )
+        return DataLoader(self.test_dataset, batch_size=self.batch_size['test'], num_workers=self.num_workers, pin_memory=True)
+
+        

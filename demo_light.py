@@ -3,15 +3,12 @@ import argparse
 import torch
 import lightning as L
 from lightning.pytorch import seed_everything
-from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 import os
 
-from Demo_Parameters import Parameters
 from Utils.LitModel import LitModel
 
-# 只保留 ShipsEar 相关的核心数据模块
 from Datasets.ShipsEar_Data_Preprocessing import Generate_Segments
 from Datasets.ShipsEar_dataloader import ShipsEarDataModule
 
@@ -30,82 +27,80 @@ def main(Params):
         data_module = ShipsEarDataModule(parent_folder=dataset_dir, batch_size=batch_size, num_workers=num_workers)
         num_classes = 5 
     else:
-        raise ValueError('代码已进行极简优化，当前仅支持 ShipsEar 数据集 (请确保参数 --data_selection 1)')
+        raise ValueError('当前仅支持 ShipsEar 数据集')
     
     DataName = "ShipsEar"
-    print(f'\n🚀 Starting Experiments for {DataName} using {model_name} 🚀')
+    torch.set_float32_matmul_precision('medium') 
     
-    numRuns = 3
-    progress_bar = True 
-    torch.set_float32_matmul_precision('medium')
+    # ==========================================
+    # SOTA 级功能 1：定义组名 (Group)，严格区分消融变体
+    # ==========================================
+    group_str = f"G{int(Params['use_graph'])}_P{int(Params['use_prior_mask'])}_TE{int(Params['use_temporal_encoder'])}_TA{int(Params['use_temporal_attention'])}"
     
-    # 记录 Macro-F1 的列表
-    all_val_f1s = []
-    all_test_f1s = []
+    print(f'\n🚀 Starting Experiments for {DataName} using {model_name} | Group: {group_str} 🚀')
     
-    # 构建极其清晰的日志保存路径名
-    exp_name = (
-        f"{model_name}_G{int(Params.get('use_graph', True))}"
-        f"_P{int(Params.get('use_prior_mask', True))}"
-        f"_TE{int(Params.get('use_temporal_encoder', True))}"
-        f"_TA{int(Params.get('use_temporal_attention', True))}"
-    )
+    # ==========================================
+    # SOTA 级功能 2：准备全局的汇总 CSV 表格
+    # ==========================================
+    csv_file = "htan_ablations_results.csv" 
+    if not os.path.isfile(csv_file):
+        with open(csv_file, "w") as f:
+            f.write("Dataset,Model,Group,Run_Index,Seed,ACC,APR_Weighted,RE_Weighted,F1_Macro,F1_Weighted,Val_Macro_F1\n")
 
+    numRuns = 3
     for run_number in range(0, numRuns):
-        # 不同的 Run 使用不同的 Seed，以验证模型初始化稳定性 (数据划分不变，因为 dataloader 会读取 txt)
-        seed_everything(run_number + 42, workers=True) 
-                  
-        print(f'\n>>> Starting Run {run_number+1}/{numRuns} (Seed: {run_number+42}) <<<\n')
+        current_seed = run_number + 42
+        seed_everything(current_seed, workers=True) 
+        
+        # ==========================================
+        # SOTA 级功能 3：建立像 MILAN 一样的极简本地文件夹
+        # 路径规范：results/ShipsEar/G1_P1_TE1_TA1/Run_0/
+        # ==========================================
+        save_dir = os.path.join("results", DataName, group_str, f"Run_{run_number}")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        print(f'\n>>> Starting [ {group_str} ] | Run {run_number+1}/{numRuns} (Seed: {current_seed}) <<<\n')
+        print(f'📁 Outputs will be saved strictly to: {save_dir}\n')
     
         checkpoint_callback = ModelCheckpoint(
-            monitor='val_macro_f1', # 强制监控 Macro-F1
-            filename='best-{epoch:02d}-{val_macro_f1:.4f}',
+            dirpath=save_dir,          # 强制把最佳权重保存在纯净目录下，别乱跑
+            filename='best_model',
+            monitor='val_macro_f1', 
             save_top_k=1,
             mode='max',
-            verbose=True,
+            verbose=False,
             save_weights_only=True
         )
     
         early_stopping_callback = EarlyStopping(
-            monitor='val_macro_f1', # 强制监控 Macro-F1
+            monitor='val_macro_f1', 
             patience=Params['patience'],
             verbose=True,
             mode='max'
         )
 
-        # 实例化模型
         model_wrapper = LitModel(Params, model_name, num_classes)
 
         if run_number == 0:
             num_params = count_trainable_params(model_wrapper)
             print(f'\n💡 Total Trainable Parameters: {num_params / 1e6:.4f} M\n')
 
-        logger = TensorBoardLogger(
-            save_dir=f"tb_logs/{DataName}_{exp_name}/Run_{run_number}",
-            name="metrics"
-        )
-        csv_logger = CSVLogger(save_dir=logger.save_dir, name="csv_logs")
-
-        # 修复了重复实例化 Trainer 的 Bug
         trainer = L.Trainer(
             max_epochs=Params['num_epochs'],
             callbacks=[early_stopping_callback, checkpoint_callback],
             deterministic=False,
-            logger=[logger, csv_logger], 
+            logger=False, # 🌟【核心手术】：完全关闭 Lightning 所有自带 Logger，彻底告别 tb_logs！
             log_every_n_steps=10,
-            enable_progress_bar=progress_bar,
+            enable_progress_bar=True,
             accelerator='gpu',       
             devices="auto"
         )
         
-        # 启动训练
+        # 1. 开始训练
         trainer.fit(model=model_wrapper, datamodule=data_module) 
-        
-        # 提取最佳验证集的 Macro-F1
         best_val_f1 = checkpoint_callback.best_model_score.item()
-        all_val_f1s.append(best_val_f1)
     
-        # 加载最佳权重进行测试
+        # 加载刚才存入 save_dir 的最佳权重
         best_model_path = checkpoint_callback.best_model_path
         best_model = LitModel.load_from_checkpoint(
             checkpoint_path=best_model_path,
@@ -114,46 +109,37 @@ def main(Params):
             num_classes=num_classes,
         )
     
-        test_results = trainer.test(model=best_model, datamodule=data_module)
-        # 获取测试集的 Macro-F1
-        best_test_f1 = test_results[0]['test_macro_f1']
-        all_test_f1s.append(best_test_f1)
+        # 2. 验证模型 (注入纯净目录，LitModel 会在里面画图)
+        best_model.test_save_dir = save_dir
+        trainer.test(model=best_model, datamodule=data_module)
+        
+        # 获取在 LitModel 内部算好的所有严谨指标
+        metrics = best_model.custom_metrics
     
-        # 记录单次运行结果
-        results_filename = f"tb_logs/{DataName}_{exp_name}/Run_{run_number}/metrics.txt"
-        with open(results_filename, "a") as file:
-            file.write(f"Run_{run_number} (Seed {run_number+42}):\n\n")
+        # 3. 自动追加写入全局 CSV 表格
+        with open(csv_file, "a") as f:
+            f.write(f"{DataName},{model_name},{group_str},{run_number},{current_seed},"
+                    f"{metrics['ACC']:.4f},{metrics['APR_Weighted']:.4f},{metrics['RE_Weighted']:.4f},"
+                    f"{metrics['F1_Macro']:.4f},{metrics['F1_Weighted']:.4f},{best_val_f1:.4f}\n")
+    
+        # 在文件夹里留一份基础日志证明
+        with open(os.path.join(save_dir, "metrics.txt"), "w") as file:
+            file.write(f"=== {model_name} ({group_str}) Run {run_number} ===\n")
             file.write(f"Best Validation Macro-F1: {best_val_f1:.4f}\n")
-            file.write(f"Best Test Macro-F1: {best_test_f1:.4f}\n\n")
-    
-    # 计算均值和标准差
-    overall_avg_val_f1 = np.mean(all_val_f1s)
-    overall_std_val_f1 = np.std(all_val_f1s)
-    overall_avg_test_f1 = np.mean(all_test_f1s)
-    overall_std_test_f1 = np.std(all_test_f1s)
-    
-    # 记录汇总结果
-    summary_filename = f"tb_logs/{DataName}_{exp_name}/summary_metrics.txt"
-    with open(summary_filename, "a") as file:
-        file.write("=== Overall Results Across All 3 Runs ===\n\n")
-        file.write(f"Overall Average Best Validation Macro-F1: {overall_avg_val_f1:.4f} ± {overall_std_val_f1:.4f}\n")
-        file.write(f"Overall Average Best Test Macro-F1: {overall_avg_test_f1:.4f} ± {overall_std_test_f1:.4f}\n\n")
+            for k, v in metrics.items():
+                file.write(f"Test {k}: {v:.4f}\n")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run Advanced UATR HTAN Experiments')
     parser.add_argument('--model', type=str, default='HTAN', help='Select baseline model architecture')
     parser.add_argument('--data_selection', type=int, default=1, help='Dataset selection: 1=ShipsEar')
     
-    # -------------------------------------------------------------
-    # 💡 核心消融实验开关 (Ablation Switches)
-    # 使用 --no-[开关名] 来关闭该模块。例如: --no-use_prior_mask
-    # -------------------------------------------------------------
-    parser.add_argument('--use_graph', default=True, action=argparse.BooleanOptionalAction, help='是否使用图网络模块')
-    parser.add_argument('--use_prior_mask', default=True, action=argparse.BooleanOptionalAction, help='是否使用谐波物理掩码')
-    parser.add_argument('--use_temporal_encoder', default=True, action=argparse.BooleanOptionalAction, help='是否使用 BiGRU 时序编码器')
-    parser.add_argument('--use_temporal_attention', default=True, action=argparse.BooleanOptionalAction, help='是否使用帧级注意力池化')
+    # 0/1 控制消融，非常严谨
+    parser.add_argument('--use_graph', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
+    parser.add_argument('--use_prior_mask', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
+    parser.add_argument('--use_temporal_encoder', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
+    parser.add_argument('--use_temporal_attention', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
     
-    # 训练超参数
     parser.add_argument('--train_batch_size', type=int, default=64, help='input batch size for training')
     parser.add_argument('--val_batch_size', type=int, default=64, help='input batch size for validation')
     parser.add_argument('--test_batch_size', type=int, default=64, help='input batch size for testing')
@@ -162,7 +148,6 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
-    # 特征参数
     parser.add_argument('--audio_feature', type=str, default='LogMelFBank', help='Audio feature for extraction')
     parser.add_argument('--window_length', type=int, default=2048, help='window length')
     parser.add_argument('--hop_length', type=int, default=512, help='hop length')
@@ -176,14 +161,19 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     
-    # 将 args 转化为字典并注入给 Parameters
-    # 假设你的 Demo_Parameters.py 中 Parameters 类支持直接读取 params_dict
-    # 或者我们在 main 函数中直接手动更新 Params
-    params = Parameters(args)
+    # 彻底抛弃旧的 Demo_Parameters.py，直接把命令行参数转为字典
+    params = vars(args).copy()
     
-    # 强制将消融开关同步进 Params 字典供 LitModel 读取
-    params_dict = vars(args)
+    # 补充内部逻辑需要的字段映射
+    params['Model_name'] = args.model
+    params['batch_size'] = {
+        'train': args.train_batch_size,
+        'val': args.val_batch_size,
+        'test': args.test_batch_size
+    }
+    
+    # 确保消融开关是严谨的布尔值
     for key in ['use_graph', 'use_prior_mask', 'use_temporal_encoder', 'use_temporal_attention']:
-        params[key] = params_dict[key]
+        params[key] = bool(params[key])
         
     main(params)
