@@ -32,6 +32,18 @@ underwater-model/
 └── requirements.txt                    # Python 环境依赖包列表
 ```
 
+## 🧠 核心模型架构与图构建流程 (HTAN)
+
+本项目在 `src/models/custom_model.py` 中定义了核心创新模型 **HTAN** (包含物理启发频率图网络 `HarmonicFrequencyGCN`)。其图构建与特征流转的严谨过程如下：
+
+1. **时频特征提取与图重构 (逐时间步的频率图)**：前端多尺度 CNN 提取时频特征。将每个时间步单独提取出来，对频率维度进行建图，张量变形为 `[B * T_out, F_out, C]`，节点代表单个时间片上的“频率 bin”。
+2. **物理先验拓扑的初始化 (静态结构约束)**：通过声学物理规律构造频率先验拓扑矩阵 `A_prior`，包含：节点自连接、相邻频带连续性连接、以及单向判断后对称赋值的 2/3/4 倍谐波连接，最后进行行归一化。
+3. **动态注意力打分与掩码融合 (先验决定拓扑，动态决定权重)**：前向传播时，计算动态注意力得分。`A_prior` 仅作为**结构掩码**，屏蔽不符合物理先验（非连续、非谐波）的边（将其注意力得分置为 `-1e9`），再对合法边做 Softmax 得到最终的动态概率转移矩阵。
+4. **图卷积传递与频率池化 (特征更新)**：使用动态概率矩阵进行消息传递，经过线性层、ReLU、残差和 LayerNorm 更新节点特征。随后恢复维度，对频率维度执行 `mean` 和 `max` 双池化并拼接，生成时间序列特征，送入后续的双向 GRU 和时间注意力层（TemporalAttention）。
+
+> **⚠️ 重要说明：当前默认训练链路与 AST 模型**
+> 尽管 `custom_model.py` 定义了严密的 HTAN 频率图网络，但目前仓库默认的训练入口 (`demo_light.py` -> `Utils/Network_functions.py`) 实际上主要实例化并运行的是 **AST (Audio Spectrogram Transformer) 系列模型**（如 `ASTBase`, `ASTAdapter`, `ASTLoRA` 等）。如果您希望训练完整的 HTAN 模型，请在 `Utils/Network_functions.py` 中自行将 `initialize_model` 的逻辑分支指向 `HTAN`。
+
 ## 🛠️ 环境依赖
 
 请确保您的计算机上已安装 Python 3.8 或更高版本。建议使用虚拟环境（如 Conda 或 venv）。
