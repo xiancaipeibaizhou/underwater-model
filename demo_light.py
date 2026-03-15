@@ -5,8 +5,9 @@ import lightning as L
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger  # 🌟 新增：论文级轻量化日志记录器
+from lightning.pytorch.callbacks import Callback  # 🌟 引入基类
 import os
+import csv  # 🌟 引入 CSV 写入模块
 
 from Utils.LitModel import LitModel
 
@@ -15,6 +16,42 @@ from Datasets.ShipsEar_dataloader import ShipsEarDataModule
 
 def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# ==========================================
+# 🌟 核心暴力破解：绝对不依赖官方 Logger，直接去内存里抠数据！
+# ==========================================
+class ForceMetricsWriter(Callback):
+    def __init__(self, save_dir):
+        self.filepath = os.path.join(save_dir, 'epoch_metrics.csv')
+        self.history = []
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # 跳过一开始的 Sanity Check
+        if trainer.sanity_checking:
+            return
+            
+        # 读取 EarlyStopping 正在监控的内存字典
+        metrics = trainer.callback_metrics
+        row = {'epoch': trainer.current_epoch}
+        for k, v in metrics.items():
+            row[k] = v.item() if isinstance(v, torch.Tensor) else v
+            
+        self.history.append(row)
+        
+        # 动态收集所有出现过的键名 (解决 Epoch 1 突然冒出 train_loss 的问题)
+        all_keys = set()
+        for r in self.history:
+            all_keys.update(r.keys())
+        
+        # 让 'epoch' 永远排在第一列，其他按字母排序
+        sorted_keys = ['epoch'] + sorted([k for k in all_keys if k != 'epoch'])
+
+        # 每次覆盖写入，绝不缓冲！
+        with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=sorted_keys)
+            writer.writeheader()
+            writer.writerows(self.history)
+
 
 def main(Params):
     model_name = Params['Model_name']
@@ -46,14 +83,16 @@ def main(Params):
     if not os.path.isfile(csv_file):
         with open(csv_file, "w") as f:
             f.write("Dataset,Model,ExpTime,Group,Run_Index,Seed,ACC,APR_Weighted,RE_Weighted,F1_Macro,F1_Weighted,Val_Macro_F1\n")
-
+    
     numRuns = 1 if Params.get('test_only') else 3
+    if Params.get('test_only'):
+        run_sequence = [Params.get('run_index', 0)]
+    else:
+        run_sequence = range(3)
 
-    for run_number in range(0, numRuns):
+    for run_number in run_sequence:
         current_seed = run_number + 42
-        seed_everything(current_seed, workers=True) 
         
-        # 🌟 核心修复 2：按时间戳生成独立根目录，彻底杜绝覆盖！
         exp_folder_name = f"{DataName}_{Params['exp_time']}" if Params.get('exp_time') else DataName
         save_dir = os.path.join("results", exp_folder_name, group_str, f"Run_{run_number}")
         os.makedirs(save_dir, exist_ok=True)
@@ -78,20 +117,21 @@ def main(Params):
             mode='max'
         )
 
+        # 🌟 实例化我们写的暴力写入插件
+        force_metrics_writer = ForceMetricsWriter(save_dir=save_dir)
+
         model_wrapper = LitModel(Params, model_name, num_classes)
 
         if run_number == 0:
             num_params = count_trainable_params(model_wrapper)
             print(f'\n💡 Total Trainable Parameters: {num_params / 1e6:.4f} M\n')
 
-        # 🌟 核心修复 1：引入 CSVLogger 记录每个 Epoch 的 Loss 和 F1 曲线
-        csv_logger = CSVLogger(save_dir=save_dir, name="training_curves")
-
         trainer = L.Trainer(
             max_epochs=Params['num_epochs'],
-            callbacks=[early_stopping_callback, checkpoint_callback],
+            # 🌟 把我们的插件塞进 callbacks 列表里！
+            callbacks=[early_stopping_callback, checkpoint_callback, force_metrics_writer],
             deterministic=False,
-            logger=csv_logger, # 👈 重新启用专门为论文准备的 CSV 记录器
+            logger=False, # 彻底干掉那个没用的官方 Logger
             log_every_n_steps=10,
             enable_progress_bar=True,
             accelerator='gpu',       
@@ -160,7 +200,11 @@ def parse_args():
     parser.add_argument('--test_snr', type=float, default=None, help='测试集注入的 SNR (dB)')
     parser.add_argument('--test_only', action='store_true', help='跳过训练，仅加载权重进行测试')
     parser.add_argument('--ckpt_path', type=str, default=None, help='仅测试模式下加载的权重路径')             
-    parser.add_argument('--exp_time', type=str, default='', help='按时间戳生成独立文件夹防止覆盖')             
+    parser.add_argument('--exp_time', type=str, default='', help='按时间戳生成独立文件夹防止覆盖')    
+    # 🌟 新增：将正则化手段暴露给命令行
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='L2 Regularization weight decay')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for the model')                   
+    parser.add_argument('--run_index', type=int, default=0, help='指定当前跑的是第几个 Seed') # 🌟 新增这一行
     args = parser.parse_args()
     return args
 
