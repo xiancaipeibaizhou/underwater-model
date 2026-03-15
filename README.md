@@ -103,11 +103,3 @@ chmod +x run_experiments.sh
 * `shipsear_data_split.json`: 记录具体的划分配置和路径映射。
 * `split_indices.txt`: 具体的样本索引。
 * `split_audit_report.json`: 数据集划分的分布审计，确保训练/验证/测试集中各类别的均衡性。
-
-## 📝 贡献指南
-
-欢迎对本项目提出改进建议！如果您发现了 Bug 或希望添加新的网络架构/特征提取方法，请随时提交 Issue 或发起 Pull Request。
-
-## 📄 许可证
-
-本项目遵循 [MIT License](LICENSE) 许可协议。
