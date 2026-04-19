@@ -55,24 +55,39 @@ class MultiScaleConvBlock(nn.Module):
         return self.fuse_pool(out)
 
 # ------------------------------------------------------------
-# 2. 物理启发频率图网络 (Physics-inspired Frequency GCN)
+# 2. 水声语义知识图谱网络 (Acoustic Knowledge-Guided GCN)
 # ------------------------------------------------------------
-class HarmonicFrequencyGCN(nn.Module):
+class AcousticKnowledgeGCN(nn.Module):
     def __init__(self, in_channels, num_freq_bins, sr=16000, fmin=0, fmax=8000):
         super().__init__()
         self.num_freq_bins = num_freq_bins  
         self.in_channels = in_channels
         self.use_prior_mask = True # 默认开启，由外部 HTAN 动态控制
         
-        self.register_buffer('A_prior', self._build_harmonic_prior(sr, fmin, fmax))
-        
+        # 1. 实体特征投影 (Q, K, V)
         self.query = nn.Linear(in_channels, in_channels // 2)
         self.key = nn.Linear(in_channels, in_channels // 2)
+        self.value = nn.Linear(in_channels, in_channels) # 新增 Value 投影
+        
         self.gcn_weight = nn.Linear(in_channels, in_channels)
         self.norm = nn.LayerNorm(in_channels)
         self.dropout = nn.Dropout(0.3)
 
-    def _build_harmonic_prior(self, sr, fmin, fmax, tol=0.2):
+        # ==================== 核心创新点 1：水声知识实体嵌入 ====================
+        # 为每一个物理频带分配一个可学习的全局语义向量，赋予图节点先验记忆
+        self.entity_embedding = nn.Parameter(torch.randn(1, num_freq_bins, in_channels))
+        
+        # ==================== 核心创新点 2：可学习的专家知识图谱 ====================
+        # 用物理公式算出来的矩阵作为参数初始化，让网络在微调时可以自动适应真实海洋信道
+        expert_prior = self._build_expert_knowledge_prior(sr, fmin, fmax)
+        self.knowledge_adj = nn.Parameter(expert_prior.clone().float())
+        
+        # ==================== 核心创新点 3：知识与数据融合门控 ====================
+        # alpha 决定了在构图时，模型有多“相信”专家图谱
+        self.alpha = nn.Parameter(torch.tensor([0.5])) 
+
+    def _build_expert_knowledge_prior(self, sr, fmin, fmax, tol=0.2):
+        """物理专家知识：计算梅尔频带中心频率的谐波倍频矩阵"""
         mel_min = 2595 * np.log10(1 + fmin / 700)
         mel_max = 2595 * np.log10(1 + fmax / 700)
         mels = np.linspace(mel_min, mel_max, self.num_freq_bins)
@@ -104,19 +119,35 @@ class HarmonicFrequencyGCN(nn.Module):
     def forward(self, x):
         B_T, n_freqs, C = x.shape
         
-        Q = self.query(x)  
-        K = self.key(x)    
-        A_logits = torch.bmm(Q, K.transpose(1, 2)) / (K.shape[-1] ** 0.5)
+        # --- 步骤 A：融入实体记忆 ---
+        # x_embedded 既有当前帧的数据特征，又有该频带的全局统计特性
+        x_embedded = x + self.entity_embedding
         
-        # 物理先验掩码开关
+        Q = self.query(x_embedded)  
+        K = self.key(x_embedded)
+        V = self.value(x) # Value 保留原始数据高保真度
+        
+        # --- 步骤 B：生成数据驱动关系网 ---
+        scale = K.shape[-1] ** 0.5
+        A_data = torch.bmm(Q, K.transpose(1, 2)) / scale
+        
+        # --- 步骤 C：物理知识图谱掩码融合开关 ---
         if getattr(self, 'use_prior_mask', True):
-            prior_mask = (self.A_prior > 0).unsqueeze(0).expand(B_T, -1, -1)
-            A_logits = A_logits.masked_fill(~prior_mask, -1e9)
+            # 保证专家知识图谱权重非负，并广播到 Batch
+            A_kg = F.relu(self.knowledge_adj)
+            A_kg = A_kg.unsqueeze(0).expand(B_T, -1, -1)
+            
+            # 软性门控融合 (彻底替换原来的 -1e9 掩码阻断)
+            A_fused = A_data + self.alpha * A_kg
+        else:
+            # 如果消融实验关掉掩码，就退化为纯自注意力网络
+            A_fused = A_data
         
-        A_dynamic = F.softmax(A_logits, dim=-1)
+        A_dynamic = F.softmax(A_fused, dim=-1)
         A_dynamic = self.dropout(A_dynamic)
 
-        z = torch.bmm(A_dynamic, x)  
+        # --- 步骤 D：图网络特征聚合 ---
+        z = torch.bmm(A_dynamic, V)  
         z = self.gcn_weight(z)
         out = self.norm(x + F.relu(z))
         
@@ -164,12 +195,17 @@ class HTAN(nn.Module):
         
         # 动态推导输出尺寸
         with torch.no_grad():
-            dummy_input = torch.zeros(1, in_channels, input_fdim, input_tdim)
+            dummy_input = torch.zeros(2, in_channels, input_fdim, input_tdim) 
+            
+            # 为了严谨，在过 dummy 前临时开启 eval 模式，之后再恢复
+            self.frontend.eval()
             dummy_out = self.frontend(dummy_input)
+            self.frontend.train()
+            
             _, cnn_out_c, f_out, t_out = dummy_out.shape
             
-        # 始终初始化，避免 DDP 报错，但前向传播时决定是否使用
-        self.harmonic_gcn = HarmonicFrequencyGCN(
+        # ★ 替换为新的知识图谱 GCN，不影响外围传参逻辑
+        self.harmonic_gcn = AcousticKnowledgeGCN(
             in_channels=cnn_out_c, 
             num_freq_bins=f_out,
             sr=16000, fmin=0, fmax=8000 
@@ -195,7 +231,7 @@ class HTAN(nn.Module):
             nn.Linear(gru_input_size, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x, extract_feature=False):  
         x = self.frontend(x)  
         B, C, F_out, T_out = x.shape
         
@@ -223,5 +259,10 @@ class HTAN(nn.Module):
             # 全局时间平均池化
             x = x.mean(dim=1)
         
+        # 核心拦截点：如果是自监督预训练模式，提取出高维特征就直接跑路
+        if extract_feature:
+            return x
+            
+        # 如果是正常监督微调/测试模式，则正常走分类器
         logits = self.classifier(x)
         return logits

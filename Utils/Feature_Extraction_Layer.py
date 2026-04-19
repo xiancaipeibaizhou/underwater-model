@@ -61,16 +61,24 @@ class Feature_Extraction_Layer(nn.Module):
             print(f"Failed to calculate output dimensions: {e}\n")
             self.output_dims = None
             
-    def forward(self, x):
+    # 修改 forward 函数，增加 return_clean 参数
+    def forward(self, x, return_clean=False):
         # 提取基础对数梅尔声谱图: [Batch, Freq, Time]
-        x = self.features[self.input_feature](x) 
+        x_clean = self.features[self.input_feature](x) 
+
+        # 复制一份用来做掩码
+        x_masked = x_clean.clone()
 
         # 仅在模型处于训练模式 (Training) 时，施加残酷的物理掩码
-        # 验证集和测试集 (Eval) 必须看清晰的完整图像
         if self.training:
-            x = self.freq_masking(x)
-            x = self.time_masking(x)
+            x_masked = self.freq_masking(x_masked)
+            x_masked = self.time_masking(x_masked)
 
-        x = x.unsqueeze(1) # 增加通道维度 -> [Batch, 1, Freq, Time]
+        x_masked = x_masked.unsqueeze(1) # 增加通道维度 -> [Batch, 1, Freq, Time]
+        x_clean = x_clean.unsqueeze(1)   # [Batch, 1, Freq, Time]
 
-        return x
+        # 🌟 如果处于自监督掩码重建模式，同时返回掩码版和干净版
+        if return_clean:
+            return x_masked, x_clean
+            
+        return x_masked

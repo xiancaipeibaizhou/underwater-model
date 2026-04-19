@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from scipy.io import wavfile
 import hashlib  # 🌟 新增：用于生成固定的路径哈希种子
-
+import random  # 🌟 新增：用于样本级随机种子
 # 🌟 新增：严谨的样本级确定性 AWGN 噪声注入函数
 def add_awgn(signal, snr_db, seed_string=None):
     """根据目标信噪比 (SNR) 注入绝对固定的高斯白噪声"""
@@ -37,11 +37,12 @@ def add_awgn(signal, snr_db, seed_string=None):
 
 class ShipsEarDataset(Dataset):
     # 🌟 修改 1：接收 snr_db 参数
-    def __init__(self, segment_list, target_sr=16000, normalize_waveform=False, snr_db=None):
+    def __init__(self, segment_list, target_sr=16000, normalize_waveform=False, snr_db=None, is_ssl=False):
         self.segment_list = segment_list
         self.target_sr = target_sr
         self.normalize_waveform = normalize_waveform
         self.snr_db = snr_db
+        self.is_ssl = is_ssl
 
     def __len__(self):
         return len(self.segment_list)
@@ -65,23 +66,44 @@ class ShipsEarDataset(Dataset):
         if signal.ndim > 1:
             signal = signal.mean(axis=1)
 
-        # 🌟 修改 2：在此处执行在线加噪，绑定绝对路径作为固定种子
-        signal = add_awgn(signal, self.snr_db, seed_string=file_path)
+        # 🌟 关键修改：如果是预训练模式，返回双视图！
+        if getattr(self, 'is_ssl', False):
+            # 视图 1：随机波形增益 + 随机动态高斯白噪声
+            gain1 = random.uniform(0.7, 1.3)
+            sig_v1 = signal.copy() * gain1
+            sig_v1 = add_awgn(sig_v1, snr_db=random.uniform(15, 30), seed_string=None) 
+            
+            # 视图 2：另一种随机增益 + 另一种强度的动态噪声
+            gain2 = random.uniform(0.7, 1.3)
+            sig_v2 = signal.copy() * gain2
+            sig_v2 = add_awgn(sig_v2, snr_db=random.uniform(10, 25), seed_string=None)
+            
+            if self.normalize_waveform:
+                max_v1 = np.max(np.abs(sig_v1))
+                if max_v1 > 0: sig_v1 = sig_v1 / max_v1
+                max_v2 = np.max(np.abs(sig_v2))
+                if max_v2 > 0: sig_v2 = sig_v2 / max_v2
+                
+            # 【核心对齐】必须返回严格的嵌套元组：((视图1, 视图2), 占位标签)
+            return (torch.tensor(sig_v1, dtype=torch.float), torch.tensor(sig_v2, dtype=torch.float)), torch.tensor(-1, dtype=torch.long)
 
-        if self.normalize_waveform:
-            max_val = np.max(np.abs(signal))
-            if max_val > 0:
-                signal = signal / max_val
+        # 常规监督模式 (微调 / 测试)
+        else:
+            signal = add_awgn(signal, self.snr_db, seed_string=file_path)
 
-        return torch.tensor(signal, dtype=torch.float), torch.tensor(label, dtype=torch.long)
+            if self.normalize_waveform:
+                max_val = np.max(np.abs(signal))
+                if max_val > 0:
+                    signal = signal / max_val
 
+            return torch.tensor(signal, dtype=torch.float), torch.tensor(label, dtype=torch.long)
 
 class ShipsEarDataModule(L.LightningDataModule):
     # 🌟 修改 3：接收外部传来的 test_snr
     def __init__(self, parent_folder='./Datasets/ShipsEar', batch_size=None, num_workers=8,
                  train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42, 
                  normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json',
-                 test_snr=None):
+                 test_snr=None, is_ssl=False):
         super().__init__()
         
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, "🚨 比例之和必须等于 1.0"
@@ -97,7 +119,8 @@ class ShipsEarDataModule(L.LightningDataModule):
         self.split_file = split_file
         self.audit_file = audit_file
         self.test_snr = test_snr # 保存测试集 SNR 配置
-        
+        self.is_ssl = is_ssl
+
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
@@ -280,10 +303,10 @@ class ShipsEarDataModule(L.LightningDataModule):
         
         self.check_data_leakage(folder_lists, segment_lists)
 
-        # 🌟 修改 4：Train 和 Val 永远保持 Clean (snr_db=None)，只有 Test 集注入配置的噪声
-        self.train_dataset = ShipsEarDataset(segment_lists['train'], normalize_waveform=self.normalize_waveform, snr_db=None)
-        self.val_dataset = ShipsEarDataset(segment_lists['val'], normalize_waveform=self.normalize_waveform, snr_db=None)
-        self.test_dataset = ShipsEarDataset(segment_lists['test'], normalize_waveform=self.normalize_waveform, snr_db=self.test_snr)
+        # 🌟 修改：只给 train_dataset 开启 is_ssl 模式，验证集和测试集永远是常规模式
+        self.train_dataset = ShipsEarDataset(segment_lists['train'], normalize_waveform=self.normalize_waveform, snr_db=None, is_ssl=self.is_ssl)
+        self.val_dataset = ShipsEarDataset(segment_lists['val'], normalize_waveform=self.normalize_waveform, snr_db=None, is_ssl=False)
+        self.test_dataset = ShipsEarDataset(segment_lists['test'], normalize_waveform=self.normalize_waveform, snr_db=self.test_snr, is_ssl=False)
 
         self._print_and_verify_distributions(folder_lists, segment_lists, inverse_class_mapping, class_mapping)
         
