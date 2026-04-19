@@ -6,30 +6,23 @@
 
 ```text
 underwater-model/
-├── Datasets/                           # 数据集处理模块
-│   ├── ShipsEar_Data_Preprocessing.py  # ShipsEar 数据预处理（降噪、分帧等）
-│   ├── ShipsEar_dataloader.py          # PyTorch DataLoader 定义
-│   └── README.md                       # 数据集相关详细说明
+├── Datasets/                           # 📦 数据集与加载模块
+│   ├── ShipsEar_Data_Preprocessing.py  # 原始音频切割与风浪去噪预处理
+│   ├── ShipsEar_dataloader.py          # 标准帧级打榜划分 (Frame-level Random Split)
+│   └── split_audit_report.json         # 数据集分布审计报告 (自动生成)
 ├── src/
-│   └── models/
-│       └── custom_model.py             # 核心深度学习模型架构定义（如 HTAN 等）
-├── Utils/                              # 工具函数与核心组件
-│   ├── Feature_Extraction_Layer.py     # 特征提取层
-│   ├── LitModel.py                     # PyTorch Lightning 训练逻辑封装 (Trainer)
-│   ├── LogMelFilterBank.py             # Log-Mel 滤波器组计算实现
-│   └── Network_functions.py            # 网络构建相关的辅助函数
-├── shipsEar_AUDIOS/                    # 原始音频存放及处理目录
-│   └── auto_label.py                   # 音频自动打标签脚本
-├── Demo_Parameters.py                  # 全局超参数与配置文件
-├── demo_light.py                       # 单次模型训练与测试的启动入口
-├── run_experiments.sh                  # 批量执行实验/消融实验的自动化 Shell 脚本
-├── feature_similarity_analysis.py      # 特征相似度与聚类分析工具
-├── plot_curves.py                      # 训练损失、准确率曲线与结果可视化工具
-├── shipsear_data_split.json            # 数据集划分配置 (Train/Val/Test)
-├── split_audit_report.json             # 数据集划分审计报告
-├── split_indices.txt                   # 数据集切分索引记录
-├── htan_ablations_results.csv          # 消融实验结果自动记录文件
-└── requirements.txt                    # Python 环境依赖包列表
+│   └── models/                         
+│       └── custom_model.py             # 🧠 核心模型骨架：Dynamic-HTAN 全套架构
+├── Utils/                              # 🛠️ 核心组件库
+│   ├── Feature_Extraction_Layer.py     # 前端 Log-Mel 时频特征提取
+│   ├── LitModel.py                     # PyTorch Lightning 监督训练核心封装
+│   └── LogMelFilterBank.py             # Mel 滤波器组数学实现
+├── Demo_Parameters.py                  # ⚙️ 基础超参数配置中心
+├── demo_light.py                       # 🚀 HTAN 模型主训练入口 (支持动态传参)
+├── baseline_resnet.py                  # 📊 竞品对比实验基线 (纯视觉黑盒模型)
+├── feature_similarity_analysis.py      # 📈 t-SNE 高维特征聚类可视化工具
+├── plot_curves.py                      # 📉 混淆矩阵与训练曲线生成器
+└── requirements.txt                    # 📦 Python 环境依赖包列表
 ```
 
 ## 🧠 核心模型架构与图构建流程 (HTAN)
