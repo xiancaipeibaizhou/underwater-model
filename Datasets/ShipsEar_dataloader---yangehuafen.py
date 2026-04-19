@@ -1,3 +1,5 @@
+# 严格划分
+
 import os
 import json
 import collections
@@ -8,8 +10,9 @@ import lightning as L
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from scipy.io import wavfile
-import hashlib  
-import random  
+import hashlib  # 🌟 新增：用于生成固定的路径哈希种子
+import random  # 🌟 新增：用于样本级随机种子
+# 🌟 新增：严谨的样本级确定性 AWGN 噪声注入函数
 
 def add_awgn(signal, snr_db, seed_string=None):
     """根据目标信噪比 (SNR) 注入绝对固定的高斯白噪声"""
@@ -36,6 +39,7 @@ def add_awgn(signal, snr_db, seed_string=None):
 
 
 class ShipsEarDataset(Dataset):
+    # 🌟 修改 1：接收 snr_db 参数
     def __init__(self, segment_list, target_sr=16000, normalize_waveform=False, snr_db=None, is_ssl=False):
         self.segment_list = segment_list
         self.target_sr = target_sr
@@ -97,8 +101,8 @@ class ShipsEarDataset(Dataset):
 
             return torch.tensor(signal, dtype=torch.float), torch.tensor(label, dtype=torch.long)
 
-
 class ShipsEarDataModule(L.LightningDataModule):
+    # 🌟 修改 3：接收外部传来的 test_snr
     def __init__(self, parent_folder='./Datasets/ShipsEar', batch_size=None, num_workers=8,
                  train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42, 
                  normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json',
@@ -117,7 +121,7 @@ class ShipsEarDataModule(L.LightningDataModule):
         self.normalize_waveform = normalize_waveform
         self.split_file = split_file
         self.audit_file = audit_file
-        self.test_snr = test_snr 
+        self.test_snr = test_snr # 保存测试集 SNR 配置
         self.is_ssl = is_ssl
 
         self.train_dataset = None
@@ -140,20 +144,19 @@ class ShipsEarDataModule(L.LightningDataModule):
             if meta.get('test_ratio') != self.test_ratio: return None
             if meta.get('parent_folder') != self.parent_folder: return None
             if meta.get('class_mapping') != current_class_mapping: return None
-            if meta.get('protocol') != "Frame-level Random Split": return None # 确保是新协议
             
-            print(f"✅ 校验通过：成功复用历史切分文件 ({meta.get('timestamp')}) [帧级随机划分]")
-            return data.get('segment_lists')
+            print(f"✅ 校验通过：成功复用历史切分文件 ({meta.get('timestamp')})")
+            return data.get('folder_lists')
             
         except Exception as e:
             print(f"⚠️ 解析切分文件失败 ({e})，将重新生成...")
             return None
 
-    def save_splits(self, segment_lists, class_mapping):
+    def save_splits(self, folder_lists, class_mapping):
         data = {
             "metadata": {
                 "timestamp": datetime.now().isoformat(),
-                "protocol": "Frame-level Random Split", # 🌟 更新协议名称
+                "protocol": "Class-wise Recording-level Split",
                 "random_seed": self.random_seed,
                 "train_ratio": self.train_ratio,
                 "val_ratio": self.val_ratio,
@@ -162,65 +165,83 @@ class ShipsEarDataModule(L.LightningDataModule):
                 "class_mapping": class_mapping,
                 "shuffle": True 
             },
-            "segment_lists": segment_lists
+            "folder_lists": folder_lists
         }
         with open(self.split_file, 'w') as f:
             json.dump(data, f, indent=4)
 
-    def check_segment_leakage(self, segment_lists):
-        # 🌟 删除了 recording 级别的隔离检查，只保留最基础的文件路径查重
+    def check_data_leakage(self, folder_lists, segment_lists):
         splits = ['train', 'val', 'test']
+        recordings = {split: set() for split in splits}
         segments = {split: set() for split in splits}
 
         for split in splits:
+            for folder_path, _ in folder_lists[split]:
+                recordings[split].add(os.path.abspath(folder_path))
             for file_path, _ in segment_lists[split]:
                 segments[split].add(os.path.abspath(file_path))
+
+        if recordings['train'].intersection(recordings['val']) or \
+           recordings['train'].intersection(recordings['test']) or \
+           recordings['val'].intersection(recordings['test']):
+            raise ValueError("🚨 数据泄漏！Train/Val/Test 之间存在 Recording 级别的重叠！")
 
         if segments['train'].intersection(segments['val']) or \
            segments['train'].intersection(segments['test']) or \
            segments['val'].intersection(segments['test']):
-            raise ValueError("🚨 数据泄漏！Train/Val/Test 之间存在相同的物理切片文件被重复分配！")
+            raise ValueError("🚨 数据泄漏！Train/Val/Test 之间存在 Segment 绝对路径的重叠！")
 
-    def _print_and_verify_distributions(self, segment_lists, inverse_class_mapping, class_mapping):
+    def _print_and_verify_distributions(self, folder_lists, segment_lists, inverse_class_mapping, class_mapping):
         splits = ['train', 'val', 'test']
         num_classes = len(inverse_class_mapping)
         
         audit_data = {
             "timestamp": datetime.now().isoformat(),
             "class_mapping": class_mapping,
-            "protocol": "Frame-level Random Split",
             "splits": {}
         }
         
         print("\n" + "="*75)
-        print("📊 数据集全局划分与类分布审计报告 (💥 帧级打榜协议 Frame-level Split)")
+        print("📊 数据集全局划分与类分布审计报告 (Recording & Segment Level)")
         print("="*75)
         print(f"🗺️  类别映射: {class_mapping}")
         print("-" * 75)
 
         for split in splits:
             print(f"[{split.upper():^5} SET]")
+            rec_counts = collections.Counter([label for _, label in folder_lists[split]])
             seg_counts = collections.Counter([label for _, label in segment_lists[split]])
+            
+            total_recs = sum(rec_counts.values())
             total_segs = sum(seg_counts.values())
             
             audit_data["splits"][split] = {
+                "total_recordings": total_recs,
                 "total_segments": total_segs,
                 "class_distribution": {}
             }
             
-            print(f"总计 -> Segments: {total_segs}")
+            print(f"总计 -> Recordings: {total_recs:<4} | Segments: {total_segs}")
             
             for class_idx in range(num_classes):
                 c_name = inverse_class_mapping[class_idx]
+                c_rec = rec_counts.get(class_idx, 0)
                 c_seg = seg_counts.get(class_idx, 0)
                 
-                if c_seg == 0:
+                if c_rec == 0 or c_seg == 0:
                     raise AssertionError(f"🚨 数据失衡: {split.upper()} 集中, 类别 [{c_name}] 数量为 0！")
 
+                rec_pct = (c_rec / total_recs) * 100 if total_recs > 0 else 0
                 seg_pct = (c_seg / total_segs) * 100 if total_segs > 0 else 0
-                audit_data["splits"][split]["class_distribution"][c_name] = {"segments": c_seg}
                 
-                print(f" Class {c_name:<2} (ID:{class_idx}) | Segs: {c_seg:>4} ({seg_pct:>5.1f}%)")
+                audit_data["splits"][split]["class_distribution"][c_name] = {
+                    "recordings": c_rec,
+                    "segments": c_seg
+                }
+                
+                print(f" Class {c_name:<2} (ID:{class_idx}) | "
+                      f"Recs: {c_rec:>3} ({rec_pct:>5.1f}%) | "
+                      f"Segs: {c_seg:>4} ({seg_pct:>5.1f}%)")
             print("-" * 75)
             
         with open(self.audit_file, 'w') as f:
@@ -233,66 +254,66 @@ class ShipsEarDataModule(L.LightningDataModule):
         class_mapping = {ship: idx for idx, ship in enumerate(ships_classes)}
         inverse_class_mapping = {idx: ship for ship, idx in class_mapping.items()}
 
-        segment_lists = self._verify_and_load_split(class_mapping)
+        folder_lists = self._verify_and_load_split(class_mapping)
 
-        # =========================================================
-        # 🌟 核心修改区：生成打榜专用的【帧级随机划分】
-        # =========================================================
-        if segment_lists is None:
-            print(f"🚀 正在基于比例 {self.train_ratio}:{self.val_ratio}:{self.test_ratio} 生成 [💥 帧级随机划分 Frame-level Split]...")
-            
-            all_segments_paths = []
-            all_segments_labels = []
+        if folder_lists is None:
+            print(f"🚀 正在基于比例 {self.train_ratio}:{self.val_ratio}:{self.test_ratio} 生成 Class-wise Recording-level Split...")
+            folder_lists = {'train': [], 'test': [], 'val': []}
 
-            # 1. 无视录音隔离，把所有切片丢进一个大池子
             for label in ships_classes:
                 label_path = os.path.join(self.parent_folder, label)
                 subfolders = sorted([f.name for f in os.scandir(label_path) if f.is_dir()])
                 
-                for subfolder in subfolders:
-                    folder_path = os.path.join(label_path, subfolder)
-                    for file in sorted(os.listdir(folder_path)):
-                        if file.endswith('.wav'):
-                            file_path = os.path.join(folder_path, file)
-                            if os.path.isfile(file_path):
-                                all_segments_paths.append(file_path)
-                                all_segments_labels.append(class_mapping[label])
+                n_total = len(subfolders)
+                
+                n_train = int(n_total * self.train_ratio)
+                n_val_test = n_total - n_train
+                relative_val_ratio = self.val_ratio / (self.val_ratio + self.test_ratio)
+                n_val = int(n_val_test * relative_val_ratio)
+                n_test = n_val_test - n_val
+                
+                if n_train == 0 or n_val == 0 or n_test == 0:
+                    raise ValueError(
+                        f"🚨 致命冲突: 类别 [{label}] 的物理录音数 ({n_total}) 无法满足 "
+                        f"{self.train_ratio}:{self.val_ratio}:{self.test_ratio} 的划分！"
+                    )
+
+                subfolders_train, subfolders_val_test = train_test_split(
+                    subfolders, train_size=self.train_ratio, shuffle=True, random_state=self.random_seed
+                )
+
+                subfolders_val, subfolders_test = train_test_split(
+                    subfolders_val_test, train_size=relative_val_ratio, shuffle=True, random_state=self.random_seed
+                )
+
+                for subfolder in subfolders_train:
+                    folder_lists['train'].append([os.path.join(label_path, subfolder), class_mapping[label]])
+                for subfolder in subfolders_val:
+                    folder_lists['val'].append([os.path.join(label_path, subfolder), class_mapping[label]])
+                for subfolder in subfolders_test:
+                    folder_lists['test'].append([os.path.join(label_path, subfolder), class_mapping[label]])
             
-            # 2. 第一次划分：分离出 测试集 (Test)
-            # stratify 确保各类别的比例在打乱后依然完美均衡
-            paths_train_val, paths_test, labels_train_val, labels_test = train_test_split(
-                all_segments_paths, all_segments_labels, 
-                test_size=self.test_ratio, 
-                random_state=self.random_seed, 
-                stratify=all_segments_labels
-            )
+            self.save_splits(folder_lists, class_mapping)
 
-            # 3. 第二次划分：分离 训练集 (Train) 和 验证集 (Val)
-            relative_val_ratio = self.val_ratio / (self.val_ratio + self.train_ratio)
-            paths_train, paths_val, labels_train, labels_val = train_test_split(
-                paths_train_val, labels_train_val, 
-                test_size=relative_val_ratio, 
-                random_state=self.random_seed, 
-                stratify=labels_train_val
-            )
+        segment_lists = {'train': [], 'test': [], 'val': []}
+        for split in ['train', 'test', 'val']:
+            for folder_path, label in folder_lists[split]:
+                for file in sorted(os.listdir(folder_path)):
+                    if file.endswith('.wav'):
+                        file_path = os.path.join(folder_path, file)
+                        if os.path.isfile(file_path):
+                            segment_lists[split].append((file_path, label))
+        
+        self.check_data_leakage(folder_lists, segment_lists)
 
-            # 4. 组装最终格式
-            segment_lists = {'train': [], 'test': [], 'val': []}
-            segment_lists['train'] = list(zip(paths_train, labels_train))
-            segment_lists['val'] = list(zip(paths_val, labels_val))
-            segment_lists['test'] = list(zip(paths_test, labels_test))
-            
-            self.save_splits(segment_lists, class_mapping)
-
-        # 检查是否只有绝对路径重叠 (合法校验)
-        self.check_segment_leakage(segment_lists)
-
+        # 🌟 修改：只给 train_dataset 开启 is_ssl 模式，验证集和测试集永远是常规模式
         self.train_dataset = ShipsEarDataset(segment_lists['train'], normalize_waveform=self.normalize_waveform, snr_db=None, is_ssl=self.is_ssl)
         self.val_dataset = ShipsEarDataset(segment_lists['val'], normalize_waveform=self.normalize_waveform, snr_db=None, is_ssl=False)
         self.test_dataset = ShipsEarDataset(segment_lists['test'], normalize_waveform=self.normalize_waveform, snr_db=self.test_snr, is_ssl=False)
 
-        self._print_and_verify_distributions(segment_lists, inverse_class_mapping, class_mapping)
+        self._print_and_verify_distributions(folder_lists, segment_lists, inverse_class_mapping, class_mapping)
         
+        # 🌟 修改 5：高能预警打印
         if self.test_snr is not None:
             print(f"🌪️  [高能预警] 当前测试集已注入固定随机种子的 AWGN 白噪声，信噪比 SNR = {self.test_snr} dB")
 
@@ -304,3 +325,5 @@ class ShipsEarDataModule(L.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size['test'], num_workers=self.num_workers, pin_memory=True)
+
+        

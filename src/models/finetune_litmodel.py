@@ -60,17 +60,23 @@ class Finetune_LitModel(L.LightningModule):
 
     def compute_prototype_loss(self, features, labels):
         """计算特征与类别原型的距离，并使用滑动平均动态更新原型"""
+        # 🌟 核心修复：必须先对特征进行 L2 归一化，防止绝对数值爆炸！
+        features_norm = F.normalize(features, p=2, dim=1)
+        
         # 1. 提取当前 batch 样本对应的本类原型
         batch_prototypes = self.prototypes[labels] 
-        # 2. 拉近样本与本类中心的距离 (MSE)
-        proto_loss = F.mse_loss(features, batch_prototypes)
+        # 🌟 同样对取出的原型进行归一化
+        batch_prototypes_norm = F.normalize(batch_prototypes, p=2, dim=1)
         
-        # 3. 滑动平均 (EMA) 更新系统中的类别原型
+        # 2. 拉近样本与本类中心的距离 (MSE)
+        proto_loss = F.mse_loss(features_norm, batch_prototypes_norm)
+        
+        # 3. 滑动平均 (EMA) 更新系统中的类别原型 (使用归一化前的原始特征更新即可)
         momentum = 0.9
-        with torch.no_grad(): # 更新过程不产生梯度
+        with torch.no_grad(): 
             for i in range(len(features)):
                 c = labels[i]
-                f = features[i]
+                f = features[i] # 用原始数值更新
                 if self.prototype_counts[c] == 0:
                     self.prototypes[c] = f
                 else:
